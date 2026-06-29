@@ -1,0 +1,178 @@
+CMK — Custom Mechanical Keyboard Firmware
+=========================================
+
+Copyright (C) 2025-2026 André Cusimano <andre.cusimano@hotmail.it>
+
+CMK is free software: you can redistribute it and/or modify it under the
+terms of the GNU General Public License version 2 as published by the
+Free Software Foundation. The full text of the license is in the file
+named LICENSE in the root of this repository, and also available at
+<https://www.gnu.org/licenses/old-licenses/gpl-2.0.html>.
+
+CMK is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or
+FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License
+for more details.
+
+SPDX-License-Identifier: GPL-2.0-only
+
+
+Hardware platform
+-----------------
+
+CMK is designed for and tested on the following hardware:
+
+  * Microcontroller : Raspberry Pi RP2350 (dual Cortex-M33 / Hazard3)
+  * Radio module    : Raspberry Pi RM2 (Radio Module 2) — pre-certified
+                      Wi-Fi/Bluetooth 5.2 module based on Infineon CYW43439
+                      - FCC ID: 2ABCB-RMC2GW4B52
+                      - CE / RED compliant
+                      - IC (Industry Canada) compliant
+  * EEPROM          : ST M24M01-R (1 Mbit I2C, optional)
+  * LED (optional)  : WS2812 / SK6812 chain driven via PIO
+
+The reference variant ("Pico 2 W class") is also supported as the
+RM2 module is the same Wi-Fi/BT subsystem found on the Raspberry Pi
+Pico 2 W board.
+
+
+Derivative work and code provenance
+-----------------------------------
+
+The CMK keyboard processing core (action system, keycode encoding,
+process-record chain, layer engine, debounce, RGB / LED matrix engines,
+WPM, send_string, eeconfig, bootmagic and the various process_*
+modules under src/core0/) is a *derivative work* based on the C core
+of the QMK firmware (https://github.com/qmk/qmk_firmware), which is
+itself derived from the TMK keyboard firmware by Jun Wako.
+
+QMK and TMK are licensed under the GNU General Public License,
+version 2 (and, for some files, "version 2 or any later version").
+Because CMK reuses, adapts and extends portions of that source code
+under copyright law, CMK as a whole is distributed under GPL v2 to
+comply with the terms of the upstream license.
+
+  - QMK firmware  (C) 2016-2026 QMK contributors        — GPL-2.0
+  - TMK keyboard  (C) Jun Wako and contributors         — GPL-2.0-or-later
+
+The original copyright notices of these projects are preserved in the
+relevant source files. Modifications introduced by the CMK project are
+copyright of their respective contributors and remain under GPL v2.
+
+
+Third-party software included or required at build time
+-------------------------------------------------------
+
+The CMK firmware links against and is built on top of the following
+third-party components. Each is governed by its own license, which is
+preserved verbatim in the respective source tree. The list below is
+provided for transparency and does not modify the terms of those
+licenses.
+
+1. Raspberry Pi Pico SDK
+   - Copyright (C) 2020 Raspberry Pi (Trading) Ltd.
+   - License: BSD 3-Clause
+   - URL: https://github.com/raspberrypi/pico-sdk
+   - File reference: pico-sdk/LICENSE.TXT
+   - Compatibility with CMK (GPL-2.0): permissive, fully compatible.
+
+2. cyw43-driver (Wi-Fi/Bluetooth chip driver, used by Pico SDK)
+   - Copyright (C) 2019-2022 George Robotics Pty Ltd.
+   - Standard license: BSD 3-Clause with non-commercial restriction.
+   - Raspberry Pi exception: pico-sdk/lib/cyw43-driver/LICENSE.RP grants
+     a perpetual non-exclusive licence to use the driver, including for
+     commercial purposes, when used together with Raspberry Pi Ltd
+     semiconductor devices (RP2040, RP2350, and any other Raspberry Pi
+     semiconductor product, including the RM2 module).
+   - CMK builds and is distributed exclusively for Raspberry Pi
+     RP2350 + RM2 hardware, therefore this exception applies.
+
+3. BTstack — Dual-Mode Bluetooth Stack
+   - Copyright (C) 2009-2026 BlueKitchen GmbH.
+   - Standard license: BSD-style with non-commercial restriction
+     (file: pico-sdk/lib/btstack/LICENSE).
+   - Raspberry Pi exception: pico-sdk/src/rp2_common/pico_btstack/LICENSE.RP
+     grants every purchaser of a Raspberry Pi Pico W, Pico WH, Pico 2 W,
+     Pico 2 WH or RM2 module a non-exclusive, non-transferable,
+     non-sublicensable, irrevocable, perpetual and worldwide licence
+     to use, copy, store, develop, modify and transmit BTstack in
+     order to integrate it into Products or Customer Products and
+     distribute BTstack as part of them.
+   - CMK is intended to run exclusively on the Raspberry Pi RM2 (and
+     by extension Pico 2 W) and falls within the scope of this
+     exception. Devices manufactured with CMK on the listed Raspberry
+     Pi hardware therefore include BTstack under the Raspberry Pi /
+     BlueKitchen commercial licence, with no additional fees due.
+   - Source: https://github.com/bluekitchen/btstack
+
+4. FreeRTOS Kernel
+   - Copyright (C) Amazon.com, Inc. or its affiliates.
+   - License: MIT
+   - URL: https://github.com/FreeRTOS/FreeRTOS-Kernel
+   - File reference: FreeRTOS-Kernel/LICENSE.md
+   - Compatibility with CMK (GPL-2.0): permissive, fully compatible.
+
+5. TinyUSB
+   - Copyright (C) Ha Thach (tinyusb.org) and contributors.
+   - License: MIT
+   - URL: https://github.com/hathach/tinyusb
+   - File reference: pico-sdk/lib/tinyusb/LICENSE
+   - Compatibility with CMK (GPL-2.0): permissive, fully compatible.
+
+6. WS2812 PIO program (pio/ws2812.pio, pio/ws2812.pio.h)
+   - Originated from the Raspberry Pi pico-examples repository.
+   - Copyright (C) 2020 Raspberry Pi (Trading) Ltd.
+   - License: BSD 3-Clause
+   - URL: https://github.com/raspberrypi/pico-examples
+
+
+Hardware certification
+----------------------
+
+The Bluetooth radio used by CMK is provided by the Raspberry Pi RM2
+module, which carries the following pre-issued radio certifications:
+
+  - FCC (United States)            : FCC ID 2ABCB-RMC2GW4B52
+  - CE / RED (European Union)      : declared by Raspberry Pi Ltd.
+  - IC / ISED (Canada)             : declared by Raspberry Pi Ltd.
+
+These certifications cover the radio subsystem only. Manufacturers
+distributing finished products based on CMK + RM2 are still
+responsible for product-level EMC testing, marking, declarations of
+conformity and any country-specific obligations of the markets they
+target.
+
+
+Source availability (GPL v2 written offer)
+------------------------------------------
+
+In compliance with section 3 of the GNU General Public License,
+version 2, the complete corresponding source code of CMK is made
+available at:
+
+    https://github.com/AndreCusimano/CMK
+
+Anyone receiving a binary build of CMK (for example pre-flashed
+firmware shipped with a hardware product) is also entitled, for a
+period of at least three (3) years from the date of distribution,
+to obtain a complete machine-readable copy of the corresponding
+source code by writing to:
+
+    André Cusimano
+    Email: andre.cusimano@hotmail.it
+
+The source will be provided on a medium customarily used for software
+interchange, for a charge no greater than the cost of physically
+performing the source distribution.
+
+
+Trademarks
+----------
+
+"Raspberry Pi", "RP2350", "Pico", "Pico W", "Pico 2 W" and "RM2" are
+trademarks of Raspberry Pi Ltd. "BTstack" is a trademark of
+BlueKitchen GmbH. "QMK" is a trademark of the QMK Firmware project.
+All other trademarks are the property of their respective owners.
+References to those trademarks in this NOTICE and in the project
+documentation are made for descriptive and identification purposes
+only and do not imply any sponsorship, endorsement or affiliation.
