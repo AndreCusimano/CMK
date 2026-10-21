@@ -638,7 +638,14 @@ void rgb_matrix_apply_sync_state(const uint8_t *frame, uint8_t len) {
     s_frame_count = (uint32_t)(frame[11] | ((uint16_t)frame[12] << 8));
     // Follower state — deliberately NOT marked dirty: the slave never persists the
     // master's config; rgb_matrix_load_eeconfig() restores its own on disengage.
-    if (!s_cfg.enable) rgb_driver_clear();
+    // Bug #13: the FN dashboard bypasses enable (see rgb_matrix_tick). Clearing
+    // here while it is up blanked it on every 250 ms resync → visible blinking.
+    // On FN release the tick's dark branch clears the strip (s_blanked is false).
+    bool overlay = false;
+#ifdef FN_OVERLAY_ENABLE
+    overlay = fn_overlay_active();
+#endif
+    if (!s_cfg.enable && !overlay) rgb_driver_clear();
 }
 
 void rgb_matrix_set_split_engaged(bool engaged) {

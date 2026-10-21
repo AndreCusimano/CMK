@@ -70,11 +70,12 @@ void clear_keyboard(void);
 // ---------------------------------------------------------------------------
 // A tap is a press immediately followed by a release. Doing register_code() +
 // unregister_code() in the SAME keyscan tick is wrong: the report is flushed
-// once per tick (keyscan.c), so the net 0→kc→0 collapses to "released" and
-// nothing is typed; on BLE the single-slot IPC report is also last-wins. These
+// once per tick (keyscan.c), so WITHOUT explicit report snapshots the net
+// 0→kc→0 collapses to "released" and nothing is typed. These
 // helpers QUEUE taps and emit press/release on SEPARATE ticks (TAP_CODE_DELAY_MS
-// apart, ≥ one BLE connection interval), pumped by tap_code_tick() from
-// action_tick(). Used by Mod-Tap/Layer-Tap, Auto Shift and Tap Dance.
+// apart), pumped by tap_code_tick() from action_tick(). Used by Auto Shift,
+// Tap Dance and Space Cadet. MT/LT instead commit both snapshots immediately
+// before replay; USB and BLE have ordered keyboard report queues.
 void tap_code_init(void);
 void tap_code(uint8_t kc);                    // queue a plain tap
 void tap_code_mods(uint8_t kc, uint8_t mods); // queue a tap with weak mods held during the press
@@ -85,9 +86,9 @@ bool tap_code_busy(void);                     // a tap is in flight or queued
 // Returns true if a report was sent.
 bool send_keyboard_report(void);
 
-// Per-tick housekeeping (R2): retries a USB keyboard send that was dropped by a
-// busy endpoint, and flushes a merged-send requested by the CM task (the merge
-// is built and sent ONLY here in keyscan context — single sender, no reordering).
+// Per-tick housekeeping: drains the ordered USB keyboard report queue, retries
+// the latest state after saturation, and flushes a merge requested by CM.
+// Queue ownership and sending stay on keyscan (single sender, no reordering).
 // Call once per keyscan tick from action_tick().
 void action_util_tick(uint32_t now_ticks);
 

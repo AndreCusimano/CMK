@@ -40,6 +40,7 @@
 #include "keycode.h"
 #include "action_util.h"
 #include "action_layer.h"
+#include "action_tapping.h"   // tapping_term_get (bug #8)
 #include "config/cmk_config.h"
 #include "config/debug_config.h"
 
@@ -270,7 +271,7 @@ void tap_dance_tick(uint32_t now_ticks) {
     if (td->count == 0) return;
 
     TickType_t elapsed = (TickType_t)(now_ticks - td->timer);
-    if (elapsed < pdMS_TO_TICKS(TAPPING_TERM)) return;
+    if (elapsed < pdMS_TO_TICKS(tapping_term_get())) return;   // bug #8: runtime term
 
     // Timeout → resolve
     td_resolve((uint8_t)s_td_active);

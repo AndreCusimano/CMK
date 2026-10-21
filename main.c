@@ -50,6 +50,7 @@
 #include "board_side.h"
 #include "keymap.h"
 #include "dynamic_keymap.h"
+#include "macro_storage.h"
 #include "led_manager.h"
 #include "bonding_store.h"
 #include "eeconfig.h"
@@ -59,6 +60,7 @@
 #include "i2c0_bus.h"
 #include "tlv/btstack_tlv_eeprom.h"
 
+#include "usb/usb_debug.h"
 #ifdef USB_ENABLE
 #include "usb/usb_hid.h"
 #endif
@@ -108,7 +110,7 @@ void vApplicationIdleHook(void) {
 // Build tag — bump this on every change that needs re-flashing. Printed at boot
 // so you can confirm from the UART log exactly which firmware is running.
 // ---------------------------------------------------------------------------
-#define CMK_BUILD_TAG "b004-usb-clean"
+#define CMK_BUILD_TAG "b030-no-instr"
 
 // ---------------------------------------------------------------------------
 // main
@@ -116,6 +118,7 @@ void vApplicationIdleHook(void) {
 
 int main(void) {
     stdio_init_all();
+    usb_debug_init();
 
     // Detect which half this is (GP41/ADC1, one-shot) and point the runtime
     // keymap/LED selectors at it. MUST run before the banner (prints the side),
@@ -165,6 +168,13 @@ int main(void) {
     dynamic_keymap_init(board_side_get());
 #endif
 
+#ifdef MACRO_STORAGE_ENABLE
+    // Phase 15e: load the EEPROM macro region (magic/version → factory reset
+    // of this region only). Needs EEPROM up; side-independent.
+    DBG_BOOT("[BOOT] macro_storage_init...\n");
+    macro_storage_init();
+#endif
+
     // action_init() depends on eeconfig (rgb_matrix_init / backlight_init
     // read defaults), so it must run AFTER eeconfig_init.
     DBG_BOOT("[BOOT] action_init (depends on eeconfig)...\n");
@@ -178,6 +188,7 @@ int main(void) {
 
     DBG_BOOT("[BOOT] ipc_init...\n");
     ipc_init();
+    ipc_power_init(time_us_64());
 
     DBG_BOOT("[BOOT] connection_manager_init...\n");
     connection_manager_init();

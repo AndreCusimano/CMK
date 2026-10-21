@@ -42,6 +42,7 @@
 #include "process_grave_esc.h"
 #include "process_magic.h"
 #include "process_dynamic_macro.h"
+#include "process_macro.h"
 #include "process_layer_lock.h"
 #include "process_key_lock.h"
 #include "process_secure.h"
@@ -51,6 +52,7 @@
 #include "process_unicodemap.h"
 #include "process_ucis.h"
 #include "process_programmable_button.h"
+#include "process_consumer.h"
 #include "process_rgb.h"
 #include "process_backlight.h"
 #include "cmk_keycodes.h"
@@ -120,16 +122,22 @@ bool process_record(const keyevent_t *event) {
     // 20. Programmable Buttons (PB_1-32)
     if (!process_programmable_button(event)) return false;
 
-    // 21. RGB (toggle, mode, HSV, speed)
+    // 21. Consumer Page (media/volume/brightness — bug #6)
+    if (!process_consumer(event)) return false;
+
+    // 22. RGB (toggle, mode, HSV, speed)
     if (!process_rgb(event)) return false;
 
-    // 22. Backlight (toggle, step, brightness)
+    // 23. Backlight (toggle, step, brightness)
     if (!process_backlight(event)) return false;
 
-    // 23. CMK custom keycodes (BLE slots, reset, etc.)
+    // 24. Macro storage playback (Phase 15e — MACRO(n), bug #5)
+    if (!process_macro(event)) return false;
+
+    // 25. CMK custom keycodes (BLE slots, reset, etc.)
     if (!process_record_cmk(event)) return false;
 
-    // 24. User hook (weak — default pass-through)
+    // 26. User hook (weak — default pass-through)
     if (!process_record_user(event)) return false;
 
     return true;  // not consumed — caller should handle as standard key

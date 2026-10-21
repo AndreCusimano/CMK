@@ -50,6 +50,7 @@ void usb_hid_start(void);
 bool usb_hid_send_kbd_report(const uint8_t report[8]);
 void usb_hid_send_mouse_report(const uint8_t report[7]);
 void usb_hid_send_pb_report(const uint8_t report[4]);
+void usb_hid_send_consumer_report(const uint8_t report[2]);
 
 // Returns true if USB is mounted and the HID interface is ready.
 // Used by ble_manager to suppress BLE report sending.
@@ -63,6 +64,7 @@ static inline void usb_hid_start(void) {}
 static inline bool usb_hid_send_kbd_report(const uint8_t report[8]) { (void)report; return false; }
 static inline void usb_hid_send_mouse_report(const uint8_t report[7]) { (void)report; }
 static inline void usb_hid_send_pb_report(const uint8_t report[4]) { (void)report; }
+static inline void usb_hid_send_consumer_report(const uint8_t report[2]) { (void)report; }
 static inline bool usb_hid_is_active(void) { return false; }
 
 #endif // USB_ENABLE

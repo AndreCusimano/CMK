@@ -105,11 +105,29 @@ uint8_t  eeconfig_read_split_mode(void);
 void     eeconfig_update_split_mode(uint8_t on);
 
 // ---------------------------------------------------------------------------
-// Keyboard and user blobs (32-bit each — for custom storage)
+// Low Power Mode idle timeouts (v8, bug #2) — SECONDS, 0 = tier disabled.
+// Runtime source for low_power.c (cached at init; low_power_refresh_config()
+// re-reads them so a SET_SETTING applies without a reboot).
 // ---------------------------------------------------------------------------
 
-uint32_t eeconfig_read_keyboard(void);
-void     eeconfig_update_keyboard(uint32_t val);
+uint16_t eeconfig_read_lp_light_s(void);
+void     eeconfig_update_lp_light_s(uint16_t seconds);
+
+uint16_t eeconfig_read_lp_deep_s(void);
+void     eeconfig_update_lp_deep_s(uint16_t seconds);
+
+// ---------------------------------------------------------------------------
+// Tapping term (bug #8) — ms, 0 = factory default (TAPPING_TERM). Consumato
+// via tapping_term_get() (action_tapping.c, che applica default+clamp).
+// Ricavato dall'ex blob `keyboard` (stesso offset, nessun version bump).
+// ---------------------------------------------------------------------------
+
+uint16_t eeconfig_read_tapping_term(void);
+void     eeconfig_update_tapping_term(uint16_t ms);
+
+// ---------------------------------------------------------------------------
+// User blob (32-bit — for custom storage)
+// ---------------------------------------------------------------------------
 
 uint32_t eeconfig_read_user(void);
 void     eeconfig_update_user(uint32_t val);

@@ -32,6 +32,8 @@
 
 #include "ble_manager.h"
 #include "ble_internal.h"
+#include "ble_link_policy.h"
+#include "ble_power.h"
 #include "ipc/ipc_core.h"
 #include "diag.h"
 #include "config/cmk_config.h"
@@ -46,6 +48,7 @@
 #include "btstack.h"
 #include "ble/gatt-service/hids_device.h"
 #include "hardware/gpio.h"
+#include "pico/time.h"
 
 #include <string.h>
 
@@ -73,6 +76,216 @@ static bool    s_relay_pending   = false;
 static hid_mouse_report_t s_relay_mouse_q[RELAY_MOUSE_SLOTS];
 static uint8_t s_relay_mouse_rd    = 0;
 static uint8_t s_relay_mouse_count = 0;
+// Diagnostics only. No per-report logging or extra HCI commands.
+static uint64_t s_mouse_queued_at[RELAY_MOUSE_SLOTS];
+static uint32_t s_mouse_rx, s_mouse_tx, s_mouse_errors, s_mouse_wait_max;
+static uint32_t s_mouse_depth_max, s_mouse_last_status;
+static uint64_t s_mouse_window_at;
+static uint32_t s_tx_requests,s_tx_callbacks,s_tx_duplicates,s_tx_errors,s_tx_wait_max;
+static uint32_t s_tx_polls,s_tx_no_slots,s_tx_reserved,s_tx_sendable,s_tx_last_error;
+static uint32_t s_tx_completed_us,s_tx_completed_ds,s_tx_inflight_us,s_tx_inflight_ds,s_tx_poll_gap;
+static uint64_t s_tx_requested_at,s_tx_last_poll;
+static bool s_tx_waiting;
+// Shape of the controller's credit return on the DS link. The packet total
+// (s_tx_completed_ds) cannot tell a link that transmits steadily from one whose
+// credits come back in bursts: both yield the same packets/s. These separate
+// them — how MANY Number-Of-Completed-Packets events arrive, how many packets
+// each one retires, and how far apart they are in connection intervals.
+static uint32_t s_nocp_events,s_nocp_max_batch,s_nocp_gap[5];
+static uint64_t s_nocp_last_at;
+// In-flight depth profile on the DS link (BTstack's own num_packets_sent, i.e.
+// packets handed to the controller and not yet completed), sampled every poll —
+// a few samples per connection interval. The per-window MAX alone cannot tell a
+// queue permanently pinned at 8 from one that fills and drains in bursts, so it
+// cannot say whether the stall arrives in one step or builds up. This does.
+// Buckets: 0, 1-2, 3-5, 6-7, 8.
+static uint32_t s_depth_hist[5],s_depth_samples,s_depth_min;
+// Right-side latency of each relayed mouse report, split at the controller
+// boundary: queue (first coalesced contribution → handed to HCI) and air
+// (handed to HCI → controller reports it completed). ACL packets of one
+// connection complete in FIFO order, so a report is done once the link's
+// cumulative completed count reaches the position it took at send time.
+#define MOUSE_FLIGHT_SLOTS 16
+typedef struct { uint32_t position; uint64_t queued_at,sent_at; } mouse_flight_t;
+static mouse_flight_t s_flight[MOUSE_FLIGHT_SLOTS];
+static uint8_t s_flight_rd,s_flight_count;
+static uint32_t s_ds_completed_total;   // monotonic per DS connection
+static uint32_t s_lat_count,s_lat_air_max,s_lat_total_max,s_mouse_capped;
+static uint64_t s_lat_air_sum,s_lat_total_sum;
+// Phase of each DS credit return inside the upstream mouse's connection grid,
+// measured from the latest mouse report (one per US connection event while the
+// mouse moves). Both links run on this controller: if the DS anchor has latched
+// onto a fixed position of the US grid and the scheduler drops the DS event
+// there, the lag windows concentrate in one band of bins that drifts slowly.
+// 8 bins over one US interval.
+static uint64_t s_us_rx_at;
+static uint32_t s_phase_bins[8],s_phase_samples;
+
+static void relay_request_send(void);
+
+// Backpressure: may another mouse report enter the controller? See
+// RELAY_MOUSE_INFLIGHT_MAX / RELAY_MOUSE_SLOW_MS in cmk_config.h.
+static bool relay_mouse_can_ship(void) {
+#if RELAY_MOUSE_INFLIGHT_MAX > 0
+    hci_connection_t *ds=hci_connection_for_handle(g_ble_periph_handle);
+    if(!ds || ds->num_packets_sent<RELAY_MOUSE_INFLIGHT_MAX) return true;
+#if RELAY_MOUSE_SLOW_MS > 0
+    // Link keeping up (oldest tracked mouse report still young) → no cap.
+    // Turning false→true only happens as packets complete, and the DS credit
+    // return re-arms the send, so no timer is needed.
+    if(!s_flight_count) return true;
+    return time_us_64()-s_flight[s_flight_rd].sent_at < RELAY_MOUSE_SLOW_MS*1000ull;
+#else
+    return false;
+#endif
+#else
+    return true;
+#endif
+}
+static void mouse_flight_track(uint64_t queued_at) {
+    hci_connection_t *ds=hci_connection_for_handle(g_ble_periph_handle);
+    if(!ds || s_flight_count==MOUSE_FLIGHT_SLOTS) return;
+    mouse_flight_t *f=&s_flight[(s_flight_rd+s_flight_count)%MOUSE_FLIGHT_SLOTS];
+    // hci_send_acl_packet_fragments() already counted this packet in flight.
+    f->position=s_ds_completed_total+ds->num_packets_sent;
+    f->queued_at=queued_at; f->sent_at=time_us_64();
+    ++s_flight_count;
+}
+static void mouse_flight_complete(uint64_t now) {
+    while(s_flight_count && s_flight[s_flight_rd].position<=s_ds_completed_total) {
+        const mouse_flight_t *f=&s_flight[s_flight_rd];
+        uint32_t air=(uint32_t)(now-f->sent_at), total=(uint32_t)(now-f->queued_at);
+        if(air>s_lat_air_max) s_lat_air_max=air;
+        if(total>s_lat_total_max) s_lat_total_max=total;
+        s_lat_air_sum+=air; s_lat_total_sum+=total; ++s_lat_count;
+        s_flight_rd=(uint8_t)((s_flight_rd+1u)%MOUSE_FLIGHT_SLOTS); --s_flight_count;
+    }
+}
+static void relay_trace_callback(void) {
+    ++s_tx_callbacks;
+    if(s_tx_waiting) {
+        uint32_t elapsed=(uint32_t)(time_us_64()-s_tx_requested_at);
+        if(elapsed>s_tx_wait_max) s_tx_wait_max=elapsed;
+        s_tx_waiting=false;
+    }
+}
+static void relay_request_send(void) {
+    ++s_tx_requests;
+    bool first=!s_tx_waiting;
+    if(first) { s_tx_requested_at=time_us_64(); s_tx_waiting=true; }
+    // BTstack may invoke the callback synchronously. Set timing BEFORE calling.
+    uint8_t rc=hids_device_request_can_send_now_event(g_ble_periph_handle);
+    if(rc==ERROR_CODE_COMMAND_DISALLOWED) ++s_tx_duplicates;
+    else if(rc!=ERROR_CODE_SUCCESS) {
+        ++s_tx_errors; s_tx_last_error=rc;
+        if(first) s_tx_waiting=false;
+    }
+}
+void ble_relay_trace_completed(hci_con_handle_t handle,uint16_t packets) {
+    if(handle==g_ble_central_handle) s_tx_completed_us+=packets;
+    if(handle!=g_ble_periph_handle) return;
+    s_tx_completed_ds+=packets;
+    ++s_nocp_events;
+    if(packets>s_nocp_max_batch) s_nocp_max_batch=packets;
+    uint64_t now=time_us_64();
+    s_ds_completed_total+=packets;
+    mouse_flight_complete(now);
+    uint32_t us=ble_manager_us_interval_us();
+    if(us && s_us_rx_at && now-s_us_rx_at<4ull*us) {
+        ++s_phase_bins[(uint32_t)((now-s_us_rx_at)%us)*8u/us];
+        ++s_phase_samples;
+    }
+    // A mouse report held back by the in-flight cap ships on this credit.
+    if(s_relay_mouse_count && g_ble_periph_subscribed && relay_mouse_can_ship())
+        relay_request_send();
+    uint32_t interval=ble_manager_ds_interval_us();
+    // Bucket the gap since the previous DS credit return, rounded to the nearest
+    // connection interval: 1,2,3,4,5+. Skip the first sample and any window in
+    // which the interval is unknown (link down) — no bucket can be attributed.
+    if(s_nocp_last_at && interval) {
+        uint32_t n=(uint32_t)((now-s_nocp_last_at+interval/2)/interval);
+        if(n<1) n=1;
+        if(n>5) n=5;
+        ++s_nocp_gap[n-1];
+    }
+    s_nocp_last_at=now;
+}
+
+#if DEBUG_MOUSE_TRACE
+// 2 s relay/link sample for the RAM recorder (compiled out with it).
+static void ble_relay_trace_poll(void) {
+    uint64_t now=time_us_64();
+    if(s_tx_last_poll && now-s_tx_last_poll>s_tx_poll_gap) s_tx_poll_gap=(uint32_t)(now-s_tx_last_poll);
+    s_tx_last_poll=now;
+    hci_connection_t *us=hci_connection_for_handle(g_ble_central_handle);
+    hci_connection_t *ds=hci_connection_for_handle(g_ble_periph_handle);
+    if(us && us->num_packets_sent>s_tx_inflight_us) s_tx_inflight_us=us->num_packets_sent;
+    if(ds) {
+        uint32_t d=ds->num_packets_sent;
+        if(d>s_tx_inflight_ds) s_tx_inflight_ds=d;
+        if(!s_depth_samples || d<s_depth_min) s_depth_min=d;
+        ++s_depth_samples;
+        ++s_depth_hist[d==0?0:d<=2?1:d<=5?2:d<=7?3:4];
+    }
+    if(s_relay_mouse_count && ds) {
+        ++s_tx_polls;
+        if(hci_number_free_acl_slots_for_handle(g_ble_periph_handle)<=0) ++s_tx_no_slots;
+        if(hci_is_packet_buffer_reserved()) ++s_tx_reserved;
+        if(hci_can_send_acl_packet_now(g_ble_periph_handle)) ++s_tx_sendable;
+    }
+    if (!s_mouse_window_at) { s_mouse_window_at=now; return; }
+    if (now-s_mouse_window_at<2000000) return;
+    uint32_t age=s_relay_mouse_count ? (uint32_t)((now-s_mouse_queued_at[s_relay_mouse_rd])/1000) : 0;
+    uint32_t w[7]={1,(uint32_t)(now/1000),s_mouse_rx,s_mouse_tx,s_mouse_errors,
+                  s_mouse_wait_max,(s_mouse_depth_max<<24)|(s_relay_mouse_count<<16)|(s_mouse_last_status<<8)};
+    ipc_trace_put(w);
+    uint32_t extra[7]={2,(uint32_t)(now/1000),age,(uint32_t)((now-s_mouse_window_at)/1000),
+        g_ble_central_handle,g_ble_periph_handle,output_ble_enabled()};
+    ipc_trace_put(extra);
+    ble_manager_trace_links();
+    uint32_t requests[7]={8,(uint32_t)(now/1000),s_tx_requests,s_tx_callbacks,s_tx_duplicates,s_tx_errors,s_tx_wait_max};
+    uint32_t blocked[7]={9,(uint32_t)(now/1000),s_tx_waiting?(uint32_t)(now-s_tx_requested_at):0,
+                        s_tx_polls,s_tx_no_slots,s_tx_reserved,s_tx_sendable};
+    uint32_t credits[7]={10,(uint32_t)(now/1000),s_tx_completed_us,s_tx_completed_ds,
+                        (s_tx_inflight_us<<16)|s_tx_inflight_ds,s_tx_poll_gap,s_tx_last_error};
+    uint32_t g3=s_nocp_gap[2]>255?255:s_nocp_gap[2];
+    uint32_t g4=s_nocp_gap[3]>255?255:s_nocp_gap[3];
+    uint32_t g5=s_nocp_gap[4]>255?255:s_nocp_gap[4];
+    uint32_t nocp[7]={13,(uint32_t)(now/1000),s_nocp_events,s_nocp_max_batch,
+                     (s_nocp_gap[0]&0xffffu)|(s_nocp_gap[1]<<16),
+                     g3|(g4<<8)|(g5<<16),ble_manager_ds_interval_us()};
+    uint32_t depth[7]={14,(uint32_t)(now/1000),
+                      (s_depth_hist[0]&0xffffu)|(s_depth_hist[1]<<16),
+                      (s_depth_hist[2]&0xffffu)|(s_depth_hist[3]<<16),
+                      s_depth_hist[4],
+                      ((s_depth_samples?s_depth_min:0)<<8)|(s_tx_inflight_ds&0xffu),
+                      s_depth_samples};
+    uint32_t bins[2]={0,0};
+    for(unsigned i=0;i<8;++i) bins[i/4]|=(s_phase_bins[i]>255?255:s_phase_bins[i])<<(8*(i%4));
+    uint32_t phase[7]={15,(uint32_t)(now/1000),bins[0],bins[1],s_phase_samples,
+                      ble_manager_us_interval_us(),ble_manager_ds_interval_us()};
+    uint32_t latency[7]={16,(uint32_t)(now/1000),s_lat_air_max,
+                        s_lat_count?(uint32_t)(s_lat_air_sum/s_lat_count):0,s_lat_total_max,
+                        s_lat_count?(uint32_t)(s_lat_total_sum/s_lat_count):0,
+                        ((s_lat_count>0xffffu?0xffffu:s_lat_count)<<16)|(s_mouse_capped>0xffffu?0xffffu:s_mouse_capped)};
+    ipc_trace_put(requests); ipc_trace_put(blocked); ipc_trace_put(credits);
+    ipc_trace_put(nocp); ipc_trace_put(depth); ipc_trace_put(phase); ipc_trace_put(latency);
+    for(unsigned i=0;i<8;++i) s_phase_bins[i]=0;
+    s_phase_samples=0;
+    s_lat_count=s_lat_air_max=s_lat_total_max=s_mouse_capped=0;
+    s_lat_air_sum=s_lat_total_sum=0;
+    s_nocp_events=s_nocp_max_batch=0;
+    for(unsigned i=0;i<5;++i) s_nocp_gap[i]=0;
+    s_depth_samples=0;
+    for(unsigned i=0;i<5;++i) s_depth_hist[i]=0;
+    s_tx_requests=s_tx_callbacks=s_tx_duplicates=s_tx_errors=s_tx_wait_max=0;
+    s_tx_polls=s_tx_no_slots=s_tx_reserved=s_tx_sendable=0;
+    s_tx_completed_us=s_tx_completed_ds=s_tx_inflight_us=s_tx_inflight_ds=s_tx_poll_gap=s_tx_last_error=0;
+    s_mouse_rx=s_mouse_tx=s_mouse_errors=s_mouse_wait_max=0;
+    s_mouse_depth_max=s_relay_mouse_count; s_mouse_last_status=0; s_mouse_window_at=now;
+}
+#endif // DEBUG_MOUSE_TRACE
+
 
 // HID report log buffer — decouples HID processing from UART output.
 // Capture writes here (overwriting old), timer prints periodically.
@@ -122,10 +335,9 @@ static bool    s_local_mouse_pending = false;
 static uint8_t s_local_pb[4]       = {0};
 static bool    s_local_pb_pending  = false;
 
-// One-shot per connection: ask the downstream host (master) for a tight
-// connection interval — we are slave here, so the L2CAP request is the
-// correct API. Hosts default to 30–50 ms, which caps the mouse relay rate.
-static bool    s_conn_params_requested = false;
+// Consumer Control report from Core 0 (bug #6 — media/volume keys)
+static uint8_t s_local_consumer[2]      = {0};
+static bool    s_local_consumer_pending = false;
 
 static void hids_device_handler(uint8_t ptype, uint16_t ch, uint8_t *pkt, uint16_t sz);
 static void log_hid_timer_handler(btstack_timer_source_t *ts);
@@ -198,7 +410,7 @@ static void kbd_merge_and_request(void) {
 
     s_kbd_pending = (s_kbd_send_wr != s_kbd_send_rd);
     if (s_kbd_pending && g_ble_periph_handle != HCI_CON_HANDLE_INVALID && g_ble_periph_subscribed) {
-        hids_device_request_can_send_now_event(g_ble_periph_handle);
+        relay_request_send();
     }
 }
 
@@ -236,12 +448,15 @@ static void relay_mouse_enqueue(const hid_mouse_report_t *m) {
         hid_mouse_report_t *oldest = &s_relay_mouse_q[s_relay_mouse_rd];
         hid_mouse_report_t *next   = &s_relay_mouse_q[(s_relay_mouse_rd + 1u) % RELAY_MOUSE_SLOTS];
         relay_mouse_fold_into(next, oldest);
+        s_mouse_queued_at[(s_relay_mouse_rd + 1u) % RELAY_MOUSE_SLOTS] = s_mouse_queued_at[s_relay_mouse_rd];
         s_relay_mouse_rd = (uint8_t)((s_relay_mouse_rd + 1u) % RELAY_MOUSE_SLOTS);
         s_relay_mouse_count--;
         DIAG_INC(relay_mouse_fold);
     }
+    s_mouse_queued_at[(s_relay_mouse_rd + s_relay_mouse_count) % RELAY_MOUSE_SLOTS] = time_us_64();
     s_relay_mouse_q[(s_relay_mouse_rd + s_relay_mouse_count) % RELAY_MOUSE_SLOTS] = *m;
     s_relay_mouse_count++;
+    if(s_relay_mouse_count>s_mouse_depth_max) s_mouse_depth_max=s_relay_mouse_count;
 }
 
 #ifdef USB_ENABLE
@@ -265,20 +480,24 @@ static void forward_upstream_to_usb(uint8_t report_id, const uint8_t *data, uint
 // Boot protocol only supports keyboard; mouse reports are skipped in boot mode.
 // NOTE: hids_device_send_input_report_for_id -> att_server_notify handles CCC check
 //       internally, so it is safe to call even if the specific report is not subscribed.
-static void send_report_to_downstream_for_id(uint8_t report_id,
-                                              const uint8_t *data, uint8_t len) {
+static uint8_t send_report_to_downstream_for_id(uint8_t report_id,
+                                                 const uint8_t *data, uint8_t len) {
     uint8_t status;
     if (s_protocol_mode == 0) {
         // Boot protocol: only keyboard supported
         if (report_id == HID_REPORT_ID_KEYBOARD) {
             status = hids_device_send_boot_keyboard_input_report(g_ble_periph_handle, data, len);
         } else {
-            return;
+            return ERROR_CODE_COMMAND_DISALLOWED;
         }
     } else {
         status = hids_device_send_input_report_for_id(g_ble_periph_handle, report_id, data, len);
     }
-    UNUSED(status);
+    if(report_id==HID_REPORT_ID_MOUSE) {
+        if(status==ERROR_CODE_SUCCESS) ++s_mouse_tx;
+        else { ++s_mouse_errors; s_mouse_last_status=status; }
+    }
+    return status;
 }
 
 // ---------------------------------------------------------------------------
@@ -338,12 +557,9 @@ static void hids_device_handler(uint8_t ptype, uint16_t ch, uint8_t *pkt, uint16
             g_ble_periph_subscribed = true;
             // DS subscribed — if US reconnect was deferred, trigger it now
             ble_central_resume_deferred_reconnect();
-            // Ask the host for a 7.5–15 ms interval (slave → L2CAP request;
-            // the host may grant a close value or refuse — best effort).
-            if (!s_conn_params_requested) {
-                s_conn_params_requested = true;
-                gap_request_connection_parameter_update(g_ble_periph_handle, 6, 12, 0, 400);
-            }
+            // Ask the host for BLE_LINK_INTERVAL (slave → L2CAP request ladder
+            // with fallbacks, once per connection — ble_link_policy.c).
+            ble_link_policy_on_ds_subscribed(g_ble_periph_handle);
         }
         C1_DBG_STATUS("[PERIPH] Report ID %u subscribed: %s\n", rep_id, enabled ? "YES" : "NO");
 #ifdef PIN_LED_CONN
@@ -367,21 +583,29 @@ static void hids_device_handler(uint8_t ptype, uint16_t ch, uint8_t *pkt, uint16
         break;
 
     case HIDS_SUBEVENT_CAN_SEND_NOW:
-        if (s_relay_mouse_count > 0) {
+        relay_trace_callback();
+        if (s_relay_mouse_count > 0 && relay_mouse_can_ship()) {
             // 1st priority: mouse relay from upstream (decoded, normalised).
             // Pop ONE queued state (FIFO) and re-arm while entries remain —
             // button transitions are distinct entries, motion is pre-coalesced.
+            // Past the in-flight cap the entry stays queued (and keeps
+            // coalescing); the DS credit return re-arms the request.
             uint8_t buf[7];
+            uint64_t queued_at=s_mouse_queued_at[s_relay_mouse_rd];
+            uint32_t wait=(uint32_t)((time_us_64()-queued_at)/1000);
+            if(wait>s_mouse_wait_max) s_mouse_wait_max=wait;
             hid_pack_mouse(&s_relay_mouse_q[s_relay_mouse_rd], buf);
             s_relay_mouse_rd = (uint8_t)((s_relay_mouse_rd + 1u) % RELAY_MOUSE_SLOTS);
             s_relay_mouse_count--;
-            send_report_to_downstream_for_id(HID_REPORT_ID_MOUSE, buf, sizeof(buf));
+            if (send_report_to_downstream_for_id(HID_REPORT_ID_MOUSE, buf, sizeof(buf)) == ERROR_CODE_SUCCESS)
+                mouse_flight_track(queued_at);
             C1_DBG_DN_M("[DN-M] sent: %02x %02x %02x %02x %02x %02x %02x (q=%u)\n",
                      buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6],
                      s_relay_mouse_count);
-            if (s_relay_mouse_count || s_relay_pending ||
-                s_local_mouse_pending || s_kbd_pending || s_local_pb_pending) {
-                hids_device_request_can_send_now_event(g_ble_periph_handle);
+            if ((s_relay_mouse_count && relay_mouse_can_ship()) || s_relay_pending ||
+                s_local_mouse_pending || s_kbd_pending || s_local_pb_pending ||
+                s_local_consumer_pending) {
+                relay_request_send();
             }
         } else if (s_relay_pending) {
             // Raw relay fallback (unknown upstream report IDs)
@@ -392,8 +616,9 @@ static void hids_device_handler(uint8_t ptype, uint16_t ch, uint8_t *pkt, uint16
                      s_relay_report[0], s_relay_report[1], s_relay_report[2],
                      s_relay_report[3], s_relay_report[4], s_relay_report[5],
                      s_relay_len > 6 ? s_relay_report[6] : 0x00);
-            if (s_local_mouse_pending || s_kbd_pending || s_local_pb_pending) {
-                hids_device_request_can_send_now_event(g_ble_periph_handle);
+            if (s_local_mouse_pending || s_kbd_pending || s_local_pb_pending ||
+                s_local_consumer_pending) {
+                relay_request_send();
             }
         } else if (s_local_mouse_pending) {
             // 2nd priority: local mouse from Core 0 Mouse Keys (Phase 9)
@@ -405,8 +630,8 @@ static void hids_device_handler(uint8_t ptype, uint16_t ch, uint8_t *pkt, uint16
                      (int16_t)(s_local_mouse[1] | (s_local_mouse[2] << 8)),
                      (int16_t)(s_local_mouse[3] | (s_local_mouse[4] << 8)),
                      (int8_t)s_local_mouse[5], (int8_t)s_local_mouse[6]);
-            if (s_kbd_pending || s_local_pb_pending) {
-                hids_device_request_can_send_now_event(g_ble_periph_handle);
+            if (s_kbd_pending || s_local_pb_pending || s_local_consumer_pending) {
+                relay_request_send();
             }
         } else if (s_kbd_pending) {
             // 3rd priority: merged keyboard — pop ONE queued state (FIFO, not last-wins)
@@ -418,14 +643,22 @@ static void hids_device_handler(uint8_t ptype, uint16_t ch, uint8_t *pkt, uint16
             send_report_to_downstream_for_id(HID_REPORT_ID_KEYBOARD, out, sizeof(out));
             C1_DBG_DN_K("[DN-K] sent keys=%02x %02x %02x %02x %02x %02x %02x %02x\n",
                      out[0], out[1], out[2], out[3], out[4], out[5], out[6], out[7]);
-            if (s_kbd_pending || s_local_pb_pending) {
-                hids_device_request_can_send_now_event(g_ble_periph_handle);
+            if (s_kbd_pending || s_local_pb_pending || s_local_consumer_pending) {
+                relay_request_send();
             }
         } else if (s_local_pb_pending) {
             // 4th priority: programmable button report (Phase 12)
             s_local_pb_pending = false;
             send_report_to_downstream_for_id(HID_REPORT_ID_PROG_BUTTON,
                                               s_local_pb, sizeof(s_local_pb));
+            if (s_local_consumer_pending) {
+                relay_request_send();
+            }
+        } else if (s_local_consumer_pending) {
+            // 5th priority: consumer control report (bug #6 — media/volume keys)
+            s_local_consumer_pending = false;
+            send_report_to_downstream_for_id(HID_REPORT_ID_CONSUMER,
+                                              s_local_consumer, sizeof(s_local_consumer));
         }
         break;
 
@@ -435,7 +668,7 @@ static void hids_device_handler(uint8_t ptype, uint16_t ch, uint8_t *pkt, uint16
 }
 
 // ---------------------------------------------------------------------------
-// Upstream HID report dispatch (from hids_client_handler in ble_central.c)
+// Upstream HID report dispatch (from hids_host_handler in ble_central.c)
 // ---------------------------------------------------------------------------
 
 // `data`/`len` arrive with the Report ID prefix already stripped.
@@ -472,6 +705,37 @@ void ble_relay_on_upstream_report(uint8_t report_id, const uint8_t *data, uint16
                   ? hid_report_is_mouse(&g_ble_upstream_map, report_id)
                   : (report_id == HID_REPORT_ID_MOUSE);
     bool is_kbd   = !is_mouse && (report_id == HID_REPORT_ID_KEYBOARD);
+    // Consumer (ID 4) is OUR report layout (bug #6). A 3rd-party upstream that
+    // happens to number a report 4 means something else entirely: relaying it
+    // into our consumer characteristic would fire random media usages, so it
+    // stays on the raw-relay path only for a CMK sibling.
+    bool is_consumer = !is_mouse && (report_id == HID_REPORT_ID_CONSUMER) &&
+                       len == 2 && ble_split_peer_is_cmk();
+    if (!is_mouse && !is_kbd && report_id == HID_REPORT_ID_CONSUMER && !is_consumer) {
+        return;
+    }
+
+    // Record accepted input before output availability/queueing. Sibling input
+    // is observed locally but is NOT re-originated on the control channel.
+    if (!len) return;
+    bool origin=!ble_split_peer_is_cmk();
+    if (is_mouse && g_ble_upstream_map_valid) {
+        hid_mouse_report_t decoded;
+        if (!hid_decode_mouse(&g_ble_upstream_map,report_id,data,len,&decoded)) return;
+        ++s_mouse_rx;
+        ble_power_hid(origin,1,decoded.buttons!=0);
+    } else if (is_kbd && len<=8) {
+        bool held=false;
+        for (uint16_t i=0;i<len;i++) if (i!=1 && data[i]) held=true;
+        ble_power_hid(origin,0,held);
+    } else {
+        bool held=false;
+        if (report_id==HID_REPORT_ID_PROG_BUTTON && len==4)
+            held=(data[0]|data[1]|data[2]|data[3])!=0;
+        else if (is_consumer)
+            held=(data[0]|data[1])!=0;   // non-zero usage = key still held
+        ble_power_hid(origin,2,held);
+    }
 
 #ifdef USB_ENABLE
     // Phase 14 ext: when USB is the selected output, route the upstream relay
@@ -494,6 +758,8 @@ void ble_relay_on_upstream_report(uint8_t report_id, const uint8_t *data, uint16
             memcpy(s_upstream_kbd, data, len);
             if (len < 8) memset(s_upstream_kbd + len, 0, 8 - len);
             forward_upstream_to_usb(HID_REPORT_ID_KEYBOARD, s_upstream_kbd, 8);
+        } else if (is_consumer) {
+            forward_upstream_to_usb(HID_REPORT_ID_CONSUMER, data, 2);
         }
         return;
     }
@@ -526,8 +792,10 @@ void ble_relay_on_upstream_report(uint8_t report_id, const uint8_t *data, uint16
             hid_mouse_report_t mouse;
             if (hid_decode_mouse(&g_ble_upstream_map, report_id,
                                  data, len, &mouse)) {
+                s_us_rx_at = time_us_64();
                 relay_mouse_enqueue(&mouse);
-                hids_device_request_can_send_now_event(g_ble_periph_handle);
+                if (relay_mouse_can_ship()) relay_request_send();
+                else ++s_mouse_capped;
             }
         } else if (is_kbd && len <= 8) {
             // Merge upstream keyboard with local keyscan state
@@ -542,7 +810,7 @@ void ble_relay_on_upstream_report(uint8_t report_id, const uint8_t *data, uint16
             s_relay_len       = copy_len;
             s_relay_report_id = report_id;
             s_relay_pending   = true;
-            hids_device_request_can_send_now_event(g_ble_periph_handle);
+            relay_request_send();
         }
     }
 }
@@ -555,6 +823,7 @@ void ble_relay_on_upstream_report(uint8_t report_id, const uint8_t *data, uint16
 // must not leak into the next session — the first CAN_SEND_NOW after
 // a reconnect (possibly to a DIFFERENT host) would type ghost keys.
 void ble_relay_on_periph_disconnect(void) {
+    s_tx_waiting=false;
     s_kbd_send_wr = s_kbd_send_rd = 0;
     memset(s_kbd_last_enq, 0, sizeof(s_kbd_last_enq));
     memset(s_kbd_merged,   0, sizeof(s_kbd_merged));
@@ -562,9 +831,11 @@ void ble_relay_on_periph_disconnect(void) {
     s_relay_pending       = false;
     s_local_mouse_pending = false;
     s_local_pb_pending    = false;
+    s_local_consumer_pending = false;
     s_relay_mouse_count   = 0;
     s_relay_mouse_rd      = 0;
-    s_conn_params_requested = false;
+    s_flight_count = s_flight_rd = 0;
+    s_ds_completed_total  = 0;
 }
 
 // Release any keys that were held by upstream — zero upstream state and
@@ -572,6 +843,7 @@ void ble_relay_on_periph_disconnect(void) {
 // downstream report; on USB it tells Core 0 the upstream contribution is
 // gone so it re-merges and flushes to USB. Skip if upstream held nothing.
 void ble_relay_on_central_disconnect(void) {
+    ble_power_clear_upstream();
     static const uint8_t s_kbd_zero[8] = {0};
     if (memcmp(s_upstream_kbd, s_kbd_zero, 8) != 0) {
         memset(s_upstream_kbd, 0, sizeof(s_upstream_kbd));
@@ -607,9 +879,9 @@ void kbd_drain_ipc_ring(void) {
 
 // Take the mouse slot if valid. A stale notify (slot already consumed) must NOT
 // send an all-zero report — that would spuriously release held buttons mid-drag.
-void mouse_slot_take(void) {
+void mouse_slot_take(bool notified) {
     if (!ipc_get_mouse_report(s_local_mouse)) {
-        DIAG_INC(ipc_stale_skip);
+        if (notified) DIAG_INC(ipc_stale_skip);
         return;
     }
 #ifdef USB_ENABLE
@@ -617,13 +889,13 @@ void mouse_slot_take(void) {
 #endif
     s_local_mouse_pending = true;
     if (g_ble_periph_subscribed) {
-        hids_device_request_can_send_now_event(g_ble_periph_handle);
+        relay_request_send();
     }
 }
 
-void pb_slot_take(void) {
+void pb_slot_take(bool notified) {
     if (!ipc_get_pb_report(s_local_pb)) {
-        DIAG_INC(ipc_stale_skip);
+        if (notified) DIAG_INC(ipc_stale_skip);
         return;
     }
 #ifdef USB_ENABLE
@@ -631,7 +903,22 @@ void pb_slot_take(void) {
 #endif
     s_local_pb_pending = true;
     if (g_ble_periph_subscribed) {
-        hids_device_request_can_send_now_event(g_ble_periph_handle);
+        relay_request_send();
+    }
+}
+
+// Consumer report slot (bug #6) — same single-slot last-wins pattern as PB.
+void consumer_slot_take(bool notified) {
+    if (!ipc_get_consumer_report(s_local_consumer)) {
+        if (notified) DIAG_INC(ipc_stale_skip);
+        return;
+    }
+#ifdef USB_ENABLE
+    if (!output_ble_enabled()) return;  // output == USB → Core 0 sends to USB
+#endif
+    s_local_consumer_pending = true;
+    if (g_ble_periph_subscribed) {
+        relay_request_send();
     }
 }
 
@@ -643,15 +930,32 @@ void pb_slot_take(void) {
 //     against (a lost FIFO *event* no longer strands Core 0 in a ghost state).
 void ble_manager_ipc_slots_poll(void) {
     kbd_drain_ipc_ring();
-    mouse_slot_take();
-    pb_slot_take();
+#if DEBUG_MOUSE_TRACE
+    ble_relay_trace_poll();
+#endif
+    ble_link_policy_poll();
+    mouse_slot_take(false);
+    pb_slot_take(false);
+    consumer_slot_take(false);
 
     ipc_ble_status_t st = {
         .periph      = (uint8_t)g_ble_periph_state,
         .central     = (uint8_t)g_ble_central_state,
         .active_slot = g_ble_active_slot,
         .split_role  = ble_split_role_value(),
+        .peer_batt   = ble_batt_peer_value(),    // bug #3
+        .mouse_batt  = ble_batt_mouse_value(),   // bug #3
         .valid       = true,
     };
     ipc_publish_ble_status(&st);
+}
+
+bool ble_relay_power_busy(void) {
+    bool held=s_local_mouse[0]!=0;
+    for (unsigned i=0;i<sizeof(s_local_pb);++i) held |= s_local_pb[i]!=0;
+    for (unsigned i=0;i<sizeof(s_local_consumer);++i) held |= s_local_consumer[i]!=0;
+    for (unsigned i=0;i<sizeof(s_local_kbd);++i) if (i!=1) held |= s_local_kbd[i]!=0;
+    bool pending=s_local_mouse_pending || s_local_pb_pending || s_local_consumer_pending || s_kbd_pending || s_relay_pending || s_relay_mouse_count;
+    // Queues staged while no host exists must not inhibit sleep forever.
+    return held || (g_ble_periph_handle!=HCI_CON_HANDLE_INVALID && g_ble_periph_subscribed && pending);
 }

@@ -27,6 +27,7 @@
 #define CMK_USB_DESCRIPTORS_H
 
 #include "config/cmk_config.h"
+#include "config/debug_config.h"
 
 #ifdef USB_ENABLE
 
@@ -41,6 +42,10 @@ enum {
 #ifdef RAW_HID_ENABLE
     ITF_NUM_HID_RAW,        // HID: Raw HID (IN+OUT, 32B, WebHID)
 #endif
+#if DEBUG_USB_SERIAL
+    ITF_NUM_CDC,
+    ITF_NUM_CDC_DATA,
+#endif
     ITF_NUM_TOTAL
 };
 
@@ -48,6 +53,9 @@ enum {
 #define EP_HID_KBD_IN    0x81
 #define EP_HID_RAW_IN    0x82
 #define EP_HID_RAW_OUT   0x02
+#define EP_CDC_NOTIFY    0x83
+#define EP_CDC_OUT       0x04
+#define EP_CDC_IN        0x84
 
 // ---------------------------------------------------------------------------
 // Descriptor externs (defined in usb_descriptors.c)

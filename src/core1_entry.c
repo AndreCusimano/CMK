@@ -39,6 +39,7 @@
 
 #include "ble/ble_manager.h"
 #include "ipc/ipc_core.h"
+#include "ble/ble_power.h"
 
 #include "pico/cyw43_arch.h"
 #include "btstack.h"
@@ -92,6 +93,7 @@ static void ipc_poll_timer_handler(btstack_timer_source_t *ts) {
     // one-message-per-tick rule above (it only stages reports / requests
     // can-send-now and copies 5 bytes of state).
     ble_manager_ipc_slots_poll();
+    ble_power_poll();
 
     // Re-arm the timer
     btstack_run_loop_set_timer(ts, IPC_POLL_INTERVAL_MS);
@@ -181,5 +183,6 @@ void core1_entry(void) {
     // entry from scratch with a clean cyw43/BTstack bring-up.
     core1_log("[Core1] deep sleep — cyw43 power down + halt\n");
     cyw43_arch_deinit();
+    ipc_power_off(); // final level survives after this core halts
     for (;;) { __asm volatile("wfi"); }
 }

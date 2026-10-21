@@ -119,6 +119,12 @@ bool send_string_is_active(void) {
     return s_ss_ptr != NULL;
 }
 
+// Shared LUT lookup for external interpreters (process_macro, Phase 15e).
+uint16_t send_string_ascii_entry(char c) {
+    if ((uint8_t)c >= 128) return 0;
+    return ascii_to_keycode[(uint8_t)c];
+}
+
 // ---------------------------------------------------------------------------
 // Tick — non-blocking, one character per SEND_STRING_DELAY interval
 // ---------------------------------------------------------------------------

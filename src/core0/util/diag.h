@@ -39,7 +39,7 @@ typedef struct {
     uint32_t kbd_ring_overflow;  // kbd ring full: oldest report dropped
     uint32_t kbd_notify_fail;    // kbd ring empty→nonempty notify lost (B3)
     uint32_t split_rx_drop;      // master: remote-event ring full (event lost)
-    uint32_t usb_kbd_drop;       // usb_hid_send_kbd skipped (!active or !ready)
+    uint32_t usb_kbd_drop;       // USB send retry (!active/!ready), or keyboard queue full
     uint32_t usb_mouse_drop;     // usb_hid_send_mouse skipped
     uint32_t usb_pb_drop;        // usb_hid_send_pb skipped
     uint32_t ih_crc_fail;        // I2C1 slave: frame rejected (CRC/len/type)
@@ -51,7 +51,7 @@ typedef struct {
     uint32_t fifo_c1c0_drop;     // ipc_push_to_core0 failed (HW FIFO full) — event lost
     uint32_t hid_ring_drop;      // upstream HID report ring full (report lost)
     uint32_t split_tx_drop;      // slave: split TX ring full (event lost)
-    uint32_t ipc_stale_skip;     // IPC_SEND_MOUSE/PB with already-consumed slot skipped
+    uint32_t ipc_stale_skip;     // FIFO mouse/PB notify already consumed; excludes ordinary empty polling
     uint32_t relay_mismatch_drop; // sibling HID dropped: split_mode mismatch (strict matching)
     uint32_t relay_mouse_fold;   // mouse relay queue full: oldest entry folded into successor
 } diag_counters_t;

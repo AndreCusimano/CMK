@@ -32,6 +32,9 @@
 #include "usb_descriptors.h"
 #include "board_side.h"
 #include "tusb.h"
+#if DEBUG_USB_SERIAL
+#include "pico/unique_id.h"
+#endif
 
 #ifdef OS_DETECTION_ENABLE
 #include "os_detection.h"
@@ -41,9 +44,10 @@
 #include <string.h>
 
 // ---------------------------------------------------------------------------
-// HID Report Descriptor — Interface 0 (Keyboard + Mouse + PB)
+// HID Report Descriptor — Interface 0 (Keyboard + Mouse + PB + Consumer)
 // ---------------------------------------------------------------------------
-// Identical to BLE hid_descriptor[] in ble_manager.c (124 bytes).
+// MUST stay byte-for-byte identical to the BLE hid_descriptor[] in
+// ble_manager.c — if one changes, update BOTH.
 
 const uint8_t desc_hid_report_kbd[] = {
     // --- Keyboard — Report ID 1 (8 bytes: modifier, reserved, 6 keycodes) ---
@@ -91,11 +95,31 @@ const uint8_t desc_hid_report_kbd[] = {
     0xc0,              // End Collection (Application)
 
     // --- Programmable Buttons — Report ID 3 (4 bytes: 32-bit bitmask) ---
-    0x05, 0x0C, 0x09, 0x01, 0xA1, 0x01,
+    // Vendor page 0xFF00, aligned to the BLE descriptor (bug #6): the old USB
+    // version used Consumer+Button pages, diverging from the macOS-safe BLE one
+    // (a second Button-page range breaks the mouse clicks on macOS).
+    0x06, 0x00, 0xFF, 0x09, 0x01, 0xA1, 0x01,
     0x85, 0x03,
-    0x05, 0x09, 0x19, 0x01, 0x29, 0x20,
+    0x19, 0x01, 0x29, 0x20,
     0x15, 0x00, 0x25, 0x01, 0x95, 0x20, 0x75, 0x01, 0x81, 0x02,
     0xC0,
+
+    // --- Consumer Control — Report ID 4 (2 bytes: one 16-bit consumer usage) ---
+    // Media/volume/brightness/screen keys (bug #6). Array field: the host holds
+    // the reported usage until a 0x0000 report. Max 0x2FF covers AC Desktop
+    // Show All Windows (0x29F) and AL Launchpad (0x2A0) for macOS.
+    0x05, 0x0C,        // Usage Page (Consumer)
+    0x09, 0x01,        // Usage (Consumer Control)
+    0xA1, 0x01,        // Collection (Application)
+    0x85, 0x04,        //   Report ID (4)
+    0x15, 0x00,        //   Logical Minimum (0)
+    0x26, 0xFF, 0x02,  //   Logical Maximum (0x2FF)
+    0x19, 0x00,        //   Usage Minimum (0)
+    0x2A, 0xFF, 0x02,  //   Usage Maximum (0x2FF)
+    0x75, 0x10,        //   Report Size (16)
+    0x95, 0x01,        //   Report Count (1)
+    0x81, 0x00,        //   Input (Data, Array, Abs)
+    0xC0,              // End Collection
 };
 
 const uint16_t desc_hid_report_kbd_len = sizeof(desc_hid_report_kbd);
@@ -106,7 +130,7 @@ const uint16_t desc_hid_report_kbd_len = sizeof(desc_hid_report_kbd);
 
 #ifdef RAW_HID_ENABLE
 // Raw HID report descriptor — Usage Page 0xFF60 / Usage 0x61 (QMK/VIA convention,
-// matches CMK_Config_Protocol.md and the WebHID filter). NOT the TinyUSB
+// matches CMK_Protocol.md and the WebHID filter). NOT the TinyUSB
 // TUD_HID_REPORT_DESC_GENERIC_INOUT macro, which emits Usage Page 0xFF00 — that
 // would make the WebHID `usagePage: 0xFF60` filter find nothing.
 // No report ID (report id 0). 32-byte IN (usage 0x62) + 32-byte OUT (usage 0x63).
@@ -140,9 +164,15 @@ static const tusb_desc_device_t desc_device = {
     .bLength            = sizeof(tusb_desc_device_t),
     .bDescriptorType    = TUSB_DESC_DEVICE,
     .bcdUSB             = 0x0200,
+#if DEBUG_USB_SERIAL
+    .bDeviceClass       = TUSB_CLASS_MISC,
+    .bDeviceSubClass    = MISC_SUBCLASS_COMMON,
+    .bDeviceProtocol    = MISC_PROTOCOL_IAD,
+#else
     .bDeviceClass       = 0x00,
     .bDeviceSubClass    = 0x00,
     .bDeviceProtocol    = 0x00,
+#endif
     .bMaxPacketSize0    = CFG_TUD_ENDPOINT0_SIZE,
     .idVendor           = USB_VID,
     .idProduct          = USB_PID,
@@ -161,10 +191,15 @@ uint8_t const* tud_descriptor_device_cb(void) {
 // Configuration Descriptor
 // ---------------------------------------------------------------------------
 
-#ifdef RAW_HID_ENABLE
-#define CONFIG_TOTAL_LEN  (TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN + TUD_HID_INOUT_DESC_LEN)
+#if DEBUG_USB_SERIAL
+#define DEBUG_CDC_DESC_LEN TUD_CDC_DESC_LEN
 #else
-#define CONFIG_TOTAL_LEN  (TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN)
+#define DEBUG_CDC_DESC_LEN 0
+#endif
+#ifdef RAW_HID_ENABLE
+#define CONFIG_TOTAL_LEN  (TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN + TUD_HID_INOUT_DESC_LEN + DEBUG_CDC_DESC_LEN)
+#else
+#define CONFIG_TOTAL_LEN  (TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN + DEBUG_CDC_DESC_LEN)
 #endif
 
 static const uint8_t desc_configuration[] = {
@@ -188,6 +223,9 @@ static const uint8_t desc_configuration[] = {
     TUD_HID_INOUT_DESCRIPTOR(ITF_NUM_HID_RAW, 0, HID_ITF_PROTOCOL_NONE,
                              sizeof(desc_hid_report_raw), EP_HID_RAW_OUT, EP_HID_RAW_IN,
                              CFG_TUD_HID_EP_BUFSIZE, 1),
+#endif
+#if DEBUG_USB_SERIAL
+    TUD_CDC_DESCRIPTOR(ITF_NUM_CDC, 4, EP_CDC_NOTIFY, 8, EP_CDC_OUT, EP_CDC_IN, 64),
 #endif
 };
 
@@ -218,6 +256,9 @@ static const char* const string_desc_arr[] = {
     [2] = CMK_NAME_LEFT,               // fallback only — index 2 (product) is
                                        // overridden at runtime by board_side_name()
     [3] = "000001",
+#if DEBUG_USB_SERIAL
+    [4] = "CMK Debug Serial",
+#endif
 };
 
 static uint16_t s_desc_str[32 + 1];
@@ -233,6 +274,13 @@ uint16_t const* tud_descriptor_string_cb(uint8_t index, uint16_t langid) {
         if (index >= sizeof(string_desc_arr) / sizeof(string_desc_arr[0])) return NULL;
         // Index 2 = product string: per-side name decided at boot.
         const char* str = (index == 2) ? board_side_name() : string_desc_arr[index];
+#if DEBUG_USB_SERIAL
+        char serial[PICO_UNIQUE_BOARD_ID_SIZE_BYTES * 2 + 1];
+        if (index == 3) {
+            pico_get_unique_board_id_string(serial, sizeof(serial));
+            str = serial;
+        }
+#endif
         for (chr_count = 0; chr_count < 31 && str[chr_count]; chr_count++) {
             s_desc_str[1 + chr_count] = str[chr_count];
         }

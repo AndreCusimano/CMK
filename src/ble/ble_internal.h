@@ -27,7 +27,7 @@
 // ble_manager.c was split into single-responsibility modules:
 //   ble_manager.c — init, HCI/SM event ROUTING, IPC dispatch, ATT callbacks
 //   ble_periph.c  — peripheral/downstream: advertising (general/directed/deferred)
-//   ble_central.c — central/upstream: scan, connect/reconnect, hids_client
+//   ble_central.c — central/upstream: scan, connect/reconnect, hids_host
 //   ble_split.c   — CMK-Split GATT service + discovery (Phase 18)
 //   ble_relay.c   — merge/relay/output: kbd merge, mouse relay, CAN_SEND_NOW
 //
@@ -101,13 +101,13 @@ void ble_periph_on_conn_failed(uint8_t status);
 void ble_periph_on_disconnected(hci_con_handle_t handle);
 
 // ---------------------------------------------------------------------------
-// ble_central.c — central/upstream (scan/connect/hids_client)
+// ble_central.c — central/upstream (scan/connect/hids_host)
 // ---------------------------------------------------------------------------
 
-void ble_central_init(void);                // hids_client_init with descriptor storage
+void ble_central_init(void);                // hids_host_init with descriptor storage
 void central_start_scanning(void);
 void central_reconnect(void);
-// Start HID-over-GATT discovery on the connected upstream (hids_client_connect).
+// Start HID-over-GATT discovery on the connected upstream (hids_host_connect).
 void ble_central_start_hid_discovery(void);
 // DS subscribed → if a US reconnect was deferred, trigger it now.
 void ble_central_resume_deferred_reconnect(void);
@@ -130,11 +130,15 @@ void ble_central_on_adv_report(uint8_t *pkt);
 void ble_split_init(uint16_t evt_value_handle, uint16_t evt_cccd_handle,
                     uint16_t snap_value_handle, uint16_t side_value_handle,
                     uint16_t mode_value_handle, uint16_t mode_cccd_handle,
-                    uint16_t rgb_value_handle);
+                    uint16_t rgb_value_handle, uint16_t power_value_handle, uint16_t power_cccd_handle,
+                    uint16_t batt_value_handle);
 // Phase 24: MASTER pushes a staged RGB sync frame to the slave (IPC_SEND_RGB_SYNC).
 // Reads the frame from ipc_get_rgb_sync_tx and writes it over rgb_sync (write
 // without response, retried on can-write so HID reports keep buffer priority).
 void ble_split_send_rgb_sync(void);
+void ble_split_power_poll(void);
+bool ble_split_power_busy(void);
+bool ble_relay_power_busy(void);
 // Phase 24b: MASTER forwards one local key hit (packed CMK_RGB_HIT) to the slave.
 void ble_split_send_rgb_hit(uint8_t packed);
 uint8_t ble_split_role_value(void);         // current split role as uint8_t (for status snapshot)
@@ -145,6 +149,7 @@ void ble_split_set_mode(bool en);           // IPC_SET_SPLIT_MODE body (hot-swit
 // peer_is_cmk = the upstream exposes the CMK-Split service (probed); states_match
 // = its split_mode equals ours. Mismatch ⇒ drop the sibling's HID reports.
 bool ble_split_peer_is_cmk(void);
+bool ble_split_peer_probe_complete(void);
 bool ble_split_states_match(void);
 // ATT callback hooks (called from ble_manager.c att_read_cb / att_write_cb):
 // read returns 0 if the handle is not a CMK-Split characteristic.
@@ -159,18 +164,41 @@ void ble_split_on_periph_disconnect(hci_con_handle_t handle);
 void ble_split_on_central_disconnect(void);
 
 // ---------------------------------------------------------------------------
+// ble_batt.c — battery levels over BLE (bug #3). SoC 0..100, 0xFF = unknown.
+// ---------------------------------------------------------------------------
+
+void ble_batt_init(void);                   // battery_service_client_init
+void ble_batt_set_local(uint8_t soc);       // IPC_SET_BATTERY_LEVEL body
+void ble_batt_set_peer(uint8_t soc);        // ble_split.c: peer_batt poll result
+uint8_t ble_batt_local_value(void);         // served on our peer_batt READ
+uint8_t ble_batt_peer_value(void);          // R3 status slot
+uint8_t ble_batt_mouse_value(void);         // R3 status slot
+// Split probe reached a definitive answer: 3rd-party upstream → start the
+// mouse BAS client (no-op for a CMK sibling).
+void ble_batt_on_upstream_probed(bool peer_is_cmk);
+// Upstream link gone or being dropped: release the BAS client, peer/mouse → 0xFF.
+void ble_batt_on_central_disconnect(void);
+
+// ---------------------------------------------------------------------------
 // ble_relay.c — merge/relay/output
 // ---------------------------------------------------------------------------
 
 void ble_relay_init(void);                  // hids_device packet handler + HID log timer
 void kbd_drain_ipc_ring(void);
-void mouse_slot_take(void);
-void pb_slot_take(void);
+void mouse_slot_take(bool notified);
+void pb_slot_take(bool notified);
+void consumer_slot_take(bool notified);     // bug #6: consumer control report (ID 4)
 // Upstream HID report (Report ID already stripped) → merge/relay/USB-forward.
 void ble_relay_on_upstream_report(uint8_t report_id, const uint8_t *data, uint16_t len);
 // R4: flush every per-connection send state on downstream disconnect.
 void ble_relay_on_periph_disconnect(void);
 // Release any keys that were held by upstream (zero + re-send merged/USB).
 void ble_relay_on_central_disconnect(void);
+
+bool ble_central_pairing_identity_event(const uint8_t *packet);
+void ble_relay_trace_completed(hci_con_handle_t handle,uint16_t packets);
+void ble_manager_trace_links(void);
+uint32_t ble_manager_ds_interval_us(void);
+uint32_t ble_manager_us_interval_us(void);
 
 #endif // CMK_BLE_INTERNAL_H

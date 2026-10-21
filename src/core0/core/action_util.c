@@ -38,6 +38,7 @@
 #include "process_secure.h"
 #include "output_select.h"
 #include "ipc/ipc_core.h"
+#include "diag.h"
 #include "config/debug_config.h"
 
 #include "FreeRTOS.h"   // pdMS_TO_TICKS (tap_code timing); taskENTER_CRITICAL (USB merge)
@@ -71,12 +72,21 @@ static bool    s_dirty;                // true if state changed since last send
 // a critical section. The BLE merge path on Core 1 is untouched.
 static uint8_t s_local_report[8];      // last local-only report (snapshot for merge)
 static uint8_t s_usb_upstream_kbd[8];  // upstream kbd contribution (set by CM task)
-static uint8_t s_usb_prev[8];          // dedup of last merged report pushed to USB
+static uint8_t s_usb_prev[8];          // dedup of last merged report accepted by our queue
+static bool    s_usb_prev_valid;
+// Single owner: keyscan. CM only updates s_usb_upstream_kbd + pending below.
+// TinyUSB copies each head before we remove it; busy keeps that head intact.
+static uint8_t s_usb_queue[USB_KBD_QUEUE_SIZE][8];
+static uint8_t s_usb_queue_rd;
+static uint8_t s_usb_queue_count;
+static volatile bool s_usb_send_pending;
+_Static_assert(USB_KBD_QUEUE_SIZE > 1 && USB_KBD_QUEUE_SIZE <= 255,
+               "USB keyboard queue must fit its uint8_t count");
 #endif
 
 // tap_code queue (non-blocking tap emitter — see header). Press and release are
-// emitted on separate ticks so both USB and the last-wins BLE IPC slot observe a
-// discrete down→up; consecutive taps serialise through the queue.
+// emitted on separate ticks; consecutive synthetic taps serialise through the
+// queue. MT/LT bypass this emitter to preserve order with physical-key replay.
 typedef struct { uint8_t kc; uint8_t mods; } tap_entry_t;
 static tap_entry_t s_tapq[TAP_CODE_QUEUE_SIZE];
 static uint8_t     s_tapq_head;        // next slot to pop
@@ -100,6 +110,10 @@ void action_util_init(void) {
     memset(s_local_report, 0, sizeof(s_local_report));
     memset(s_usb_upstream_kbd, 0, sizeof(s_usb_upstream_kbd));
     memset(s_usb_prev, 0, sizeof(s_usb_prev));
+    s_usb_prev_valid = false;
+    s_usb_queue_rd = 0;
+    s_usb_queue_count = 0;
+    s_usb_send_pending = false;
 #endif
     tap_code_init();
 }
@@ -260,15 +274,27 @@ void tap_code_tick(uint32_t now_ticks) {
 // ---------------------------------------------------------------------------
 
 #ifdef USB_ENABLE
-// R2: USB keyboard delivery is CONFIRMED, single-sender, retried.
-//   - The dedup snapshot (s_usb_prev) is committed only when TinyUSB actually
-//     accepted the report. Before R2 a busy endpoint dropped the report while the
-//     dedup advanced anyway → a lost RELEASE was never re-sent (stuck key).
-//   - The merge is built and sent ONLY from the keyscan task (send path + the
-//     action_util_tick retry). The CM task no longer sends directly: it updates
-//     the upstream contribution and raises s_usb_send_pending. One sender → no
-//     out-of-order sends between tasks.
-static volatile bool s_usb_send_pending = false;
+// Queue acceptance and endpoint delivery are separate: dedup advances only on
+// enqueue; the read index advances only when TinyUSB accepts the head. Keeping
+// just a pending flag/current state loses a replayed press+release while busy.
+// All queue operations run on keyscan; no new cross-task USB sender is added.
+static bool usb_keyboard_session_active(void) {
+    if (output_usb_enabled() && usb_hid_is_active()) return true;
+    // Never replay old typing after unplug/suspend or switching away from USB.
+    // On return, send the current merged state even if it equals the old dedup.
+    s_usb_queue_rd = 0;
+    s_usb_queue_count = 0;
+    s_usb_prev_valid = false;
+    s_usb_send_pending = true;
+    return false;
+}
+
+static void usb_keyboard_flush(void) {
+    if (s_usb_queue_count && usb_hid_send_kbd_report(s_usb_queue[s_usb_queue_rd])) {
+        s_usb_queue_rd = (uint8_t)((s_usb_queue_rd + 1u) % USB_KBD_QUEUE_SIZE);
+        --s_usb_queue_count;
+    }
+}
 
 // Build merged = local OR upstream (upstream keycodes first, 6KRO — same rule as
 // the BLE merge on Core 1) and push to USB. Source arrays are snapshotted under a
@@ -277,6 +303,9 @@ static volatile bool s_usb_send_pending = false;
 static void usb_send_merged(void) {
     uint8_t merged[8];
     bool    changed;
+
+    if (!usb_keyboard_session_active()) return;
+    usb_keyboard_flush();
 
     taskENTER_CRITICAL();
     memset(merged, 0, sizeof(merged));
@@ -288,23 +317,27 @@ static void usb_send_merged(void) {
     for (int i = 2; i < 8 && slot < 8; i++) {
         if (s_local_report[i]) merged[slot++] = s_local_report[i];
     }
-    changed = (memcmp(merged, s_usb_prev, 8) != 0);
+    changed = !s_usb_prev_valid || (memcmp(merged, s_usb_prev, 8) != 0);
     taskEXIT_CRITICAL();
 
     if (!changed) {
         s_usb_send_pending = false;
         return;
     }
-    if (usb_hid_send_kbd_report(merged)) {
-        // Delivered to TinyUSB — commit the dedup snapshot.
-        taskENTER_CRITICAL();
-        memcpy(s_usb_prev, merged, 8);
-        taskEXIT_CRITICAL();
-        s_usb_send_pending = false;
-    } else {
-        // Endpoint busy / unmounted — retry from action_util_tick (next tick).
+    if (s_usb_queue_count == USB_KBD_QUEUE_SIZE) {
+        // Bounded overload: preserve queued order, retry the latest state later.
+        // Intermediate states beyond capacity can be lost, but never silently.
+        DIAG_INC(usb_kbd_drop);
         s_usb_send_pending = true;
+        return;
     }
+    uint8_t tail = (uint8_t)((s_usb_queue_rd + s_usb_queue_count) % USB_KBD_QUEUE_SIZE);
+    memcpy(s_usb_queue[tail], merged, 8);
+    ++s_usb_queue_count;
+    memcpy(s_usb_prev, merged, 8);
+    s_usb_prev_valid = true;
+    s_usb_send_pending = false;
+    usb_keyboard_flush();
 }
 
 void action_util_set_usb_upstream_kbd(const uint8_t up[8]) {
@@ -319,8 +352,11 @@ void action_util_set_usb_upstream_kbd(const uint8_t up[8]) {
 void action_util_tick(uint32_t now_ticks) {
     (void)now_ticks;
 #ifdef USB_ENABLE
-    if (s_usb_send_pending && output_usb_enabled()) {
+    if (!usb_keyboard_session_active()) return;
+    if (s_usb_send_pending) {
         usb_send_merged();
+    } else {
+        usb_keyboard_flush();
     }
 #endif
 }

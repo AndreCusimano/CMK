@@ -22,7 +22,8 @@
 //
 // low_power.h — automatic idle low-power state machine (Core 0).
 //
-// Two tiers gated on keyboard inactivity:
+// Keyboard activity (both halves) gates LIGHT; keyboard/HID inactivity gates DEEP.
+// The inter-core request is cancellable until COMMITTED; LP_DEEP means OFF confirmed.
 //   ACTIVE → LIGHT (LP_LIGHT_IDLE_MS): LEDs + 5V boost rail off, keyscan
 //            throttled; BLE stays connected (instant wake).
 //   LIGHT  → DEEP  (LP_DEEP_IDLE_MS):  BLE radio powered off, core sleeps until
@@ -48,9 +49,18 @@ typedef enum {
 // One-shot init (call from action_init).
 void low_power_init(void);
 
+// Re-read the runtime idle timeouts from eeconfig (lp_light_s/lp_deep_s,
+// seconds -> ms; 0 = tier disabled). Called by low_power_init and by the config
+// protocol after SET_SETTING, so a change applies without a reboot.
+void low_power_refresh_config(void);
+
 // Register keyboard activity; resets the idle timer and wakes to ACTIVE.
 // Called from keyscan on every local/remote key event. now = tick count (ms).
 void low_power_note_activity(uint32_t now);
+// Remote events affect this half but must not be echoed as local activity.
+void low_power_note_remote_activity(uint32_t now);
+void low_power_update_held(bool held);
+bool low_power_reboot_needed(void);
 
 // Advance the idle state machine. Called from action_tick (keyscan loop).
 void low_power_tick(uint32_t now);

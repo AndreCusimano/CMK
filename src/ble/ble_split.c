@@ -37,6 +37,8 @@
 //
 
 #include "ble_internal.h"
+#include "ble_power.h"
+#include "pico/time.h"
 #include "ipc/ipc_core.h"
 #include "diag.h"
 #include "config/cmk_config.h"
@@ -64,6 +66,15 @@ static split_role_t     s_split_role          = SPLIT_STANDALONE;
 static bool             s_split_enabled       = false;
 // SLAVE: the downstream (Peripheral) connection that subscribed our matrix_event.
 static hci_con_handle_t s_split_master_handle = HCI_CON_HANDLE_INVALID;
+// Dedicated bidirectional power-control lane. No dependency on RGB options.
+static uint16_t s_power_value, s_power_cccd;
+static hci_con_handle_t s_power_sub=HCI_CON_HANDLE_INVALID;
+static gatt_client_characteristic_t s_power_char;
+static gatt_client_notification_t s_power_listener;
+static bool s_power_client_ready, s_power_notify_pending, s_power_listening;
+static uint64_t s_power_tx_at;
+static uint32_t s_power_remote_matrix;
+
 // Local 24-bit pressed bitmap (served on a matrix_snapshot READ; updated in C).
 static uint8_t          s_split_snapshot[3]   = {0, 0, 0};
 // Peripheral: the downstream subscribed to our split_mode NOTIFY (hot-switch:
@@ -80,6 +91,7 @@ static gatt_client_characteristic_t s_split_snap_char;     // matrix_snapshot (R
 static gatt_client_characteristic_t s_split_side_char;     // side_id (READ)
 static gatt_client_characteristic_t s_split_mode_char;     // split_mode (READ+NOTIFY)
 static gatt_client_characteristic_t s_split_rgb_char;      // rgb_sync (WRITE_NR, Phase 24)
+static gatt_client_characteristic_t s_split_batt_char;     // peer_batt (READ, bug #3)
 static gatt_client_notification_t   s_split_notification;  // matrix_event subscription
 static gatt_client_notification_t   s_split_mode_notification; // split_mode subscription
 static uint8_t  s_split_peer_side = 0;                    // slave's board side (read via side_id)
@@ -96,7 +108,8 @@ static uint8_t  s_split_peer_mode       = 0;
 // maintenance timer (R4 pattern: a sync reject must never strand the state).
 static bool     s_pending_reeval        = false;
 typedef enum { SD_IDLE = 0, SD_SVC, SD_CHARS, SD_READ_SIDE, SD_READ_MODE, SD_SUB_MODE,
-               SD_SUBSCRIBE, SD_UNSUBSCRIBE, SD_READ_SNAP } split_disc_step_t;
+               SD_SUBSCRIBE, SD_UNSUBSCRIBE, SD_READ_SNAP, SD_SUB_POWER,
+               SD_READ_BATT } split_disc_step_t;
 static split_disc_step_t s_split_disc_step = SD_IDLE;
 // Role to land on when the in-flight matrix_event unsubscribe completes.
 static split_role_t s_split_unsub_target = SPLIT_STANDALONE;
@@ -118,6 +131,12 @@ static uint8_t  s_rgb_ring_tail = 0;
 
 // Split snapshot resync timer (R3).
 #define SPLIT_SNAP_RESYNC_MS 500
+// peer_batt poll (bug #3): SoC moves ~1 %/minutes, a read a minute is plenty.
+// A failed read retries sooner. Armed to "now" by the probe → first read at
+// the first idle maintenance tick.
+#define SPLIT_BATT_POLL_MS       60000
+#define SPLIT_BATT_RETRY_MS      5000
+static uint32_t s_batt_next_read_ms = 0;
 static btstack_timer_source_t s_split_snap_timer;
 static void split_snap_timer_handler(btstack_timer_source_t *ts);
 
@@ -130,6 +149,7 @@ static uint16_t s_att_side_value_handle = 0;  // side_id VALUE
 static uint16_t s_att_mode_value_handle = 0;  // split_mode VALUE
 static uint16_t s_att_mode_cccd_handle  = 0;  // split_mode CLIENT_CONFIGURATION
 static uint16_t s_att_rgb_value_handle  = 0;  // rgb_sync VALUE (Phase 24, slave RX)
+static uint16_t s_att_batt_value_handle = 0;  // peer_batt VALUE (bug #3)
 
 static void split_gatt_client_handler(uint8_t ptype, uint16_t ch, uint8_t *pkt, uint16_t sz);
 static void att_split_packet_handler(uint8_t ptype, uint16_t ch, uint8_t *pkt, uint16_t sz);
@@ -174,7 +194,10 @@ static void split_slave_reset_state(void) {
 void ble_split_init(uint16_t evt_value_handle, uint16_t evt_cccd_handle,
                     uint16_t snap_value_handle, uint16_t side_value_handle,
                     uint16_t mode_value_handle, uint16_t mode_cccd_handle,
-                    uint16_t rgb_value_handle) {
+                    uint16_t rgb_value_handle, uint16_t power_value_handle, uint16_t power_cccd_handle,
+                    uint16_t batt_value_handle) {
+    s_power_value=power_value_handle; s_power_cccd=power_cccd_handle;
+    s_att_batt_value_handle = batt_value_handle;
     s_att_evt_value_handle  = evt_value_handle;
     s_att_evt_cccd_handle   = evt_cccd_handle;
     s_att_snap_value_handle = snap_value_handle;
@@ -205,6 +228,10 @@ uint8_t ble_split_role_value(void) {
 // through to the default ATT handling).
 uint16_t ble_split_att_read(uint16_t attribute_handle, uint16_t offset,
                             uint8_t *buffer, uint16_t buffer_size) {
+    if (attribute_handle==s_power_value) {
+        uint8_t frame[POWER_WIRE_SIZE]; ble_power_frame(frame);
+        return att_read_callback_handle_blob(frame,sizeof(frame),offset,buffer,buffer_size);
+    }
     // CMK-Split side_id (Phase 18): 1 byte = this half's board side (0=L, 1=R).
     if (attribute_handle == s_att_side_value_handle) {
         uint8_t side = (uint8_t)board_side_get();
@@ -220,6 +247,11 @@ uint16_t ble_split_att_read(uint16_t attribute_handle, uint16_t offset,
         uint8_t mode = s_split_enabled ? 1 : 0;
         return att_read_callback_handle_blob(&mode, 1, offset, buffer, buffer_size);
     }
+    // CMK-Split peer_batt (bug #3): this half's SoC, 0xFF = unknown.
+    if (attribute_handle == s_att_batt_value_handle) {
+        uint8_t soc = ble_batt_local_value();
+        return att_read_callback_handle_blob(&soc, 1, offset, buffer, buffer_size);
+    }
     return 0;
 }
 
@@ -232,6 +264,20 @@ uint16_t ble_split_att_read(uint16_t attribute_handle, uint16_t offset,
 int ble_split_att_write(hci_con_handle_t con_handle, uint16_t attribute_handle,
                         uint8_t *buffer, uint16_t buffer_size) {
     uint16_t cccd;
+    if (attribute_handle==s_power_value || attribute_handle==s_power_cccd) {
+        if (gap_encryption_key_size(con_handle)<16 ||
+            (con_handle!=s_mode_sub_handle && con_handle!=s_split_master_handle))
+            return ATT_ERROR_WRITE_NOT_PERMITTED;
+        if (attribute_handle==s_power_cccd) {
+            if (buffer_size!=2 || !buffer || buffer[1] || buffer[0]>1)
+                return ATT_ERROR_INVALID_ATTRIBUTE_VALUE_LENGTH;
+            s_power_sub=buffer[0] ? con_handle : HCI_CON_HANDLE_INVALID;
+            s_power_tx_at=0;
+            return 0;
+        }
+        ble_power_link(con_handle,true,s_power_sub==con_handle);
+        return ble_power_receive(con_handle,buffer,buffer_size) ? 0 : ATT_ERROR_INVALID_ATTRIBUTE_VALUE_LENGTH;
+    }
 
     // rgb_sync (Phase 24): MASTER→SLAVE RGB effect state, write-without-response.
     // Forward to Core 0 only while we are the SLAVE (the central writes it after
@@ -284,6 +330,10 @@ int ble_split_att_write(hci_con_handle_t con_handle, uint16_t attribute_handle,
 // Split: if our master (the downstream that subscribed matrix_event) dropped,
 // fall back to STANDALONE (resume local typing) and reset the SLAVE transport.
 void ble_split_on_periph_disconnect(hci_con_handle_t handle) {
+    if (handle==s_power_sub) {
+        s_power_sub=HCI_CON_HANDLE_INVALID; s_power_notify_pending=false;
+        ble_power_link(HCI_CON_HANDLE_INVALID,false,false);
+    }
     if (handle == s_mode_sub_handle) {
         s_mode_sub_handle     = HCI_CON_HANDLE_INVALID;
         s_mode_notify_pending = false;
@@ -298,6 +348,10 @@ void ble_split_on_periph_disconnect(hci_con_handle_t handle) {
 // Split: the upstream dropped → abort discovery, forget everything we knew
 // about the peer (re-probed on the next connection) and fall back to STANDALONE.
 void ble_split_on_central_disconnect(void) {
+    if (s_power_listening) gatt_client_stop_listening_for_characteristic_value_updates(&s_power_listener);
+    s_power_listening=false; s_power_client_ready=false; s_power_char.value_handle=0;
+    s_power_remote_matrix=0; ble_power_peer_keys(0);
+    ble_power_link(HCI_CON_HANDLE_INVALID,false,false);
     s_split_discovering     = false;
     s_split_disc_step       = SD_IDLE;
     s_split_peer_probed     = false;
@@ -305,6 +359,7 @@ void ble_split_on_central_disconnect(void) {
     s_split_peer_mode_valid = false;
     s_pending_reeval        = false;
     s_split_rgb_char.value_handle = 0;   // Phase 24: forget the slave's rgb_sync handle
+    s_split_batt_char.value_handle = 0;  // bug #3 (the SoC itself is reset by ble_batt)
     s_rgb_ring_tail = s_rgb_ring_head;   // drop any queued RGB frames
     if (s_split_role == SPLIT_MASTER || s_split_role == SPLIT_MISMATCH) {
         split_set_role(SPLIT_STANDALONE, 0);
@@ -361,8 +416,15 @@ static void att_split_packet_handler(uint8_t ptype, uint16_t ch, uint8_t *pkt, u
     }
 
     // 1) matrix_event ring (SLAVE → MASTER).
-    if (s_split_master_handle == HCI_CON_HANDLE_INVALID) return;
-    if (s_split_tx_tail == s_split_tx_head) return;   // ring empty
+    if (s_split_master_handle == HCI_CON_HANDLE_INVALID || s_split_tx_tail == s_split_tx_head) {
+        // Only use the split lane after all key events; retry without dropping.
+        if (s_power_notify_pending && s_power_sub!=HCI_CON_HANDLE_INVALID) {
+            uint8_t frame[POWER_WIRE_SIZE]; ble_power_frame(frame);
+            if (att_server_notify(s_power_sub,s_power_value,frame,sizeof(frame))==ERROR_CODE_SUCCESS)
+                s_power_notify_pending=false;
+        }
+        return;
+    }
     uint8_t evt = s_split_tx_ring[s_split_tx_tail];
     s_split_tx_tail = (uint8_t)((s_split_tx_tail + 1) % SPLIT_TX_RING);
     att_server_notify(s_split_master_handle, s_att_evt_value_handle, &evt, 1);
@@ -463,7 +525,7 @@ void ble_split_send_rgb_hit(uint8_t packed) {
 // ---------------------------------------------------------------------------
 // CMK-Split discovery (Central / MASTER side, Phase 18)
 // ---------------------------------------------------------------------------
-// Kicked off after the upstream HID service is ready (the hids_client has released
+// Kicked off after the upstream HID service is ready (the hids_host has released
 // the gatt_client). Runs REGARDLESS of our own split_mode (strict matching needs
 // to know whether the upstream is a CMK sibling and what its mode is). Steps chain
 // strictly on GATT_EVENT_QUERY_COMPLETE: discover the CMK-Split service → its
@@ -473,11 +535,15 @@ void ble_split_send_rgb_hit(uint8_t packed) {
 
 void split_start_discovery(void) {
     if (g_ble_central_handle == HCI_CON_HANDLE_INVALID) return;
+    if (s_power_listening) gatt_client_stop_listening_for_characteristic_value_updates(&s_power_listener);
+    s_power_listening=false; s_power_client_ready=false; s_power_char.value_handle=0;
     s_split_svc_found              = false;
     s_split_evt_char.value_handle  = 0;
     s_split_side_char.value_handle = 0;
     s_split_mode_char.value_handle = 0;
     s_split_rgb_char.value_handle  = 0;
+    s_split_batt_char.value_handle = 0;
+    s_batt_next_read_ms            = btstack_run_loop_get_time_ms();
     s_split_peer_probed            = false;
     s_split_peer_is_cmk_f          = false;
     s_split_peer_mode_valid        = false;
@@ -510,6 +576,8 @@ static void split_gatt_client_handler(uint8_t ptype, uint16_t ch, uint8_t *pkt, 
         else if (memcmp(c.uuid128, cmk_split_side_id_uuid,         16) == 0) s_split_side_char = c;
         else if (memcmp(c.uuid128, cmk_split_mode_uuid,            16) == 0) s_split_mode_char = c;
         else if (memcmp(c.uuid128, cmk_split_rgb_sync_uuid,        16) == 0) s_split_rgb_char  = c;
+        else if (memcmp(c.uuid128, cmk_split_power_uuid,           16) == 0) s_power_char = c;
+        else if (memcmp(c.uuid128, cmk_split_peer_batt_uuid,       16) == 0) s_split_batt_char = c;
         break;
     }
 
@@ -525,7 +593,11 @@ static void split_gatt_client_handler(uint8_t ptype, uint16_t ch, uint8_t *pkt, 
             s_split_peer_mode_valid = true;
         } else if (s_split_disc_step == SD_READ_SNAP && vlen >= 3) {
             uint32_t snap = (uint32_t)val[0] | ((uint32_t)val[1] << 8) | ((uint32_t)val[2] << 16);
+            s_power_remote_matrix=snap & 0x00FFFFFFu;
+            ble_power_peer_keys(s_power_remote_matrix);
             ipc_push_to_core0(IPC_ENCODE(IPC_SPLIT_RX_SNAPSHOT, snap & 0x00FFFFFFu));
+        } else if (s_split_disc_step == SD_READ_BATT && vlen >= 1) {
+            ble_batt_set_peer(val[0]);
         }
         break;
     }
@@ -535,6 +607,11 @@ static void split_gatt_client_handler(uint8_t ptype, uint16_t ch, uint8_t *pkt, 
         // matrix_event (raw key change from the slave) vs split_mode (the peer
         // toggled → re-arbitrate the role on the live link).
         uint16_t vhandle = gatt_event_notification_get_value_handle(pkt);
+        if (vhandle==s_power_char.value_handle && s_power_client_ready) {
+            ble_power_receive(gatt_event_notification_get_handle(pkt),
+                gatt_event_notification_get_value(pkt),gatt_event_notification_get_value_length(pkt));
+            break;
+        }
         if (gatt_event_notification_get_value_length(pkt) < 1) break;
         uint8_t v0 = gatt_event_notification_get_value(pkt)[0];
         if (vhandle == s_split_mode_char.value_handle) {
@@ -546,6 +623,13 @@ static void split_gatt_client_handler(uint8_t ptype, uint16_t ch, uint8_t *pkt, 
             C1_DBG_SPLIT("[SPLIT] rx<-slave evt=0x%02x (r=%u c=%u %s)\n",
                          v0, CMK_SPLIT_EVT_ROW(v0), CMK_SPLIT_EVT_COL(v0),
                          CMK_SPLIT_EVT_PRESSED(v0) ? "DN" : "UP");
+            uint8_t row=CMK_SPLIT_EVT_ROW(v0), col=CMK_SPLIT_EVT_COL(v0);
+            if (row<MATRIX_ROWS && col<MATRIX_COLS) {
+                uint32_t bit=1u<<(row*MATRIX_COLS+col);
+                if (CMK_SPLIT_EVT_PRESSED(v0)) s_power_remote_matrix|=bit;
+                else s_power_remote_matrix&=~bit;
+                ble_power_peer_keys(s_power_remote_matrix);
+            }
             ipc_push_to_core0(IPC_ENCODE(IPC_SPLIT_RX_EVENT, v0));
         }
         break;
@@ -570,6 +654,7 @@ static void split_gatt_client_handler(uint8_t ptype, uint16_t ch, uint8_t *pkt, 
                 s_split_discovering = false; s_split_disc_step = SD_IDLE;
                 s_split_peer_probed = true;  s_split_peer_is_cmk_f = false;
                 C1_DBG_STATUS("[SPLIT] no CMK-Split on upstream → STANDALONE/relay\n");
+                ble_batt_on_upstream_probed(false);   // bug #3: try its Battery Service
             }
             break;
         case SD_CHARS:
@@ -588,6 +673,7 @@ static void split_gatt_client_handler(uint8_t ptype, uint16_t ch, uint8_t *pkt, 
                 s_split_discovering = false; s_split_disc_step = SD_IDLE;
                 s_split_peer_probed = true;  s_split_peer_is_cmk_f = false;
                 C1_DBG_STATUS("[SPLIT] CMK-Split chars incomplete/old FW → STANDALONE/relay\n");
+                ble_batt_on_upstream_probed(false);   // bug #3: try its Battery Service
             }
             break;
         case SD_READ_SIDE:
@@ -621,12 +707,29 @@ static void split_gatt_client_handler(uint8_t ptype, uint16_t ch, uint8_t *pkt, 
                 s_split_peer_is_cmk_f = true;
                 C1_DBG_STATUS("[SPLIT] sibling probed: side=%u mode=%u (ours=%u)\n",
                               s_split_peer_side, s_split_peer_mode, (unsigned)s_split_enabled);
+                if (s_power_char.value_handle) {
+                    s_split_disc_step=SD_SUB_POWER; s_split_discovering=true;
+                    gatt_client_listen_for_characteristic_value_updates(&s_power_listener,
+                        split_gatt_client_handler,g_ble_central_handle,&s_power_char);
+                    s_power_listening=true;
+                    if (gatt_client_write_client_characteristic_configuration(split_gatt_client_handler,
+                        g_ble_central_handle,&s_power_char,GATT_CLIENT_CHARACTERISTICS_CONFIGURATION_NOTIFICATION)
+                        == ERROR_CODE_SUCCESS) break;
+                    s_split_disc_step=SD_IDLE; s_split_discovering=false;
+                }
                 split_reevaluate();
             } else {
                 // Transient failure → probed stays false, maintenance timer retries.
                 gatt_client_stop_listening_for_characteristic_value_updates(&s_split_mode_notification);
                 C1_DBG_STATUS("[SPLIT] split_mode subscribe failed 0x%02x → retry later\n", status);
             }
+            break;
+        case SD_SUB_POWER:
+            s_split_discovering=false; s_split_disc_step=SD_IDLE;
+            s_power_client_ready=status==ATT_ERROR_SUCCESS;
+            s_power_tx_at=0;
+            C1_DBG_STATUS("[LP] peer control subscription %s\n",s_power_client_ready?"ready":"failed");
+            split_reevaluate();
             break;
         case SD_SUBSCRIBE:
             s_split_discovering = false; s_split_disc_step = SD_IDLE;
@@ -636,11 +739,15 @@ static void split_gatt_client_handler(uint8_t ptype, uint16_t ch, uint8_t *pkt, 
                 // last relay report would stay merged forever — release any keys
                 // it was holding (a key held through the engage stuck at the PC).
                 ble_relay_on_central_disconnect();
-                // Tighten the inter-half link for low typing latency (7.5–15 ms).
+                // Tighten the inter-half link for low typing latency, at an
+                // interval deliberately coprime with the mouse link's — see
+                // SPLIT_LINK_INTERVAL in cmk_config.h for why a multiple of it
+                // lets the radio latch into losing most of our events.
                 // We are MASTER on this handle → direct HCI update. The L2CAP
                 // request API (gap_request_connection_parameter_update) is
                 // slave→master only — the peer rejects it without effect.
-                gap_update_connection_parameters(g_ble_central_handle, 6, 12, 0, 400);
+                gap_update_connection_parameters(g_ble_central_handle,
+                                                 SPLIT_LINK_INTERVAL, SPLIT_LINK_INTERVAL, 0, 400);
                 // Read the slave's full pressed bitmap once for an initial re-sync.
                 if (s_split_snap_char.value_handle) {
                     s_split_disc_step   = SD_READ_SNAP;
@@ -659,17 +766,12 @@ static void split_gatt_client_handler(uint8_t ptype, uint16_t ch, uint8_t *pkt, 
             break;
         case SD_UNSUBSCRIBE:
             // Live disengage (hot-switch OFF or peer left the split): land on the
-            // role decided at re-eval time. Relax the conn params the engage had
-            // tightened (battery). On a remote-side error the link is likely dying
-            // anyway — the disconnect hooks finish the cleanup.
+            // role decided at re-eval time. The link keeps BLE_LINK_INTERVAL: no
+            // relaxing here, ble_link_policy.c would only undo it (every master
+            // link stays at the one interval — relay mode still carries the mouse
+            // over it). On a remote-side error the link is likely dying anyway —
+            // the disconnect hooks finish the cleanup.
             s_split_discovering = false; s_split_disc_step = SD_IDLE;
-            // MASTER on this handle → direct HCI update (see SD_SUBSCRIBE).
-            // Relax only when no upstream HID is connected: in relay mode the
-            // sibling keeps forwarding mouse/kbd reports over this link, and a
-            // 30–50 ms interval would starve the mouse frame rate again.
-            if (g_ble_central_state != CENTRAL_CONNECTED) {
-                gap_update_connection_parameters(g_ble_central_handle, 24, 40, 0, 400);
-            }
             if (s_split_unsub_target == SPLIT_MISMATCH) {
                 ble_relay_on_central_disconnect();   // release any upstream-held keys
                 split_set_role(SPLIT_MISMATCH, s_split_peer_side);
@@ -680,6 +782,13 @@ static void split_gatt_client_handler(uint8_t ptype, uint16_t ch, uint8_t *pkt, 
         case SD_READ_SNAP:
             // Initial snapshot delivered in the VALUE_QUERY_RESULT above; done.
             s_split_discovering = false; s_split_disc_step = SD_IDLE;
+            break;
+        case SD_READ_BATT:
+            // Value delivered in VALUE_QUERY_RESULT. Best-effort: a failure
+            // only retries sooner, it never touches the split state.
+            s_split_disc_step = SD_IDLE;
+            s_batt_next_read_ms = btstack_run_loop_get_time_ms() +
+                (status == ATT_ERROR_SUCCESS ? SPLIT_BATT_POLL_MS : SPLIT_BATT_RETRY_MS);
             break;
         default:
             break;
@@ -791,8 +900,30 @@ static void split_snap_timer_handler(btstack_timer_source_t *ts) {
         split_reevaluate();
     } else if (idle && !s_split_peer_probed &&                   // (b)
                g_ble_upstream_map_valid) {
-        // map_valid ⇒ the hids_client finished its discovery (gatt_client free).
+        // map_valid ⇒ the hids_host finished its discovery (gatt_client free).
         split_start_discovery();
+    } else if (idle && s_split_peer_is_cmk_f && s_power_char.value_handle && !s_power_client_ready) {
+        // Subscription may initially race encryption; retry without disrupting
+        // the established matrix/HID connection or appending a listener twice.
+        if (!s_power_listening) {
+            gatt_client_listen_for_characteristic_value_updates(&s_power_listener,
+                split_gatt_client_handler,g_ble_central_handle,&s_power_char);
+            s_power_listening=true;
+        }
+        s_split_disc_step=SD_SUB_POWER; s_split_discovering=true;
+        if (gatt_client_write_client_characteristic_configuration(split_gatt_client_handler,
+            g_ble_central_handle,&s_power_char,GATT_CLIENT_CHARACTERISTICS_CONFIGURATION_NOTIFICATION)
+            != ERROR_CODE_SUCCESS) { s_split_disc_step=SD_IDLE; s_split_discovering=false; }
+    } else if (idle && s_split_peer_is_cmk_f && s_split_batt_char.value_handle != 0 &&
+               (int32_t)(btstack_run_loop_get_time_ms() - s_batt_next_read_ms) >= 0) {
+        // Bug #3: poll the sibling's SoC (any mode: relay and mismatch too —
+        // the PC's battery reading must not depend on the split role).
+        s_split_disc_step = SD_READ_BATT;
+        if (gatt_client_read_value_of_characteristic(
+                split_gatt_client_handler, g_ble_central_handle, &s_split_batt_char)
+            != ERROR_CODE_SUCCESS) {
+            s_split_disc_step = SD_IDLE;   // gatt client busy — retry next period
+        }
     } else if (idle && s_split_role == SPLIT_MASTER &&           // (c)
                s_split_snap_char.value_handle != 0) {
         s_split_disc_step = SD_READ_SNAP;
@@ -818,3 +949,36 @@ bool ble_split_states_match(void) {
     return s_split_peer_mode_valid &&
            ((s_split_peer_mode != 0) == s_split_enabled);
 }
+
+// 4 Hz bounded state refresh; each frame retains the age of the original input.
+// Failed TX keeps the newest state pending. It cannot create fictitious activity.
+void ble_split_power_poll(void) {
+    bool central=s_split_peer_is_cmk_f && g_ble_central_handle!=HCI_CON_HANDLE_INVALID;
+    hci_con_handle_t handle=central ? g_ble_central_handle : s_mode_sub_handle;
+    bool present=handle!=HCI_CON_HANDLE_INVALID;
+    bool ready=present && gap_encryption_key_size(handle)>=16 &&
+               (central ? s_power_client_ready : s_power_sub==handle);
+    ble_power_link(handle,present,ready);
+    uint64_t now=time_us_64();
+    if (!ready || now<s_power_tx_at) return;
+    if (central) {
+        if (s_split_discovering) return;
+        uint8_t frame[POWER_WIRE_SIZE]; ble_power_frame(frame);
+        if (gatt_client_write_value_of_characteristic_without_response(handle,
+            s_power_char.value_handle,sizeof(frame),frame)!=ERROR_CODE_SUCCESS) return;
+    } else {
+        if (!s_power_notify_pending) {
+            s_power_notify_pending=true;
+            att_server_request_can_send_now_event(handle);
+        } else {
+            // A busy HID lane can delay this callback. Re-request at bounded rate.
+            att_server_request_can_send_now_event(handle);
+        }
+    }
+    s_power_tx_at=now+250000;
+}
+bool ble_split_power_busy(void) {
+    return s_split_tx_head!=s_split_tx_tail;
+}
+
+bool ble_split_peer_probe_complete(void) { return s_split_peer_probed; }

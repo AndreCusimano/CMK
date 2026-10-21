@@ -39,6 +39,17 @@
 #define ENABLE_LE_CENTRAL             // Central role: connect to slave/mouse
 #define ENABLE_LE_SECURE_CONNECTIONS  // BLE SC pairing
 
+// BTstack v1.8 workaround (pico-sdk 2.3.0): ENABLE_LE_SECURE_CONNECTIONS implies
+// ENABLE_ECC_P256, but btstack_crypto.c only defines ECC_P256_KEYGEN_EXTRA_RANDOM
+// for the software backends (micro-ecc / mbedTLS). With controller-based ECC — our
+// case, the CYW43439 does P-256 in the controller — the macro is undefined and the
+// btstack_crypto_ecc_p256_random[] declaration fails to compile. That array is dead
+// on the controller path, so 0 reproduces the v1.7 sizing (64 B) exactly.
+// Remove once upstream adds a fallback default.
+#ifndef ECC_P256_KEYGEN_EXTRA_RANDOM
+#define ECC_P256_KEYGEN_EXTRA_RANDOM  0
+#endif
+
 // Logging (forwarded to UART via stdio)
 #define ENABLE_LOG_ERROR
 #define ENABLE_LOG_INFO
@@ -60,9 +71,13 @@
 // Without HAVE_MALLOC this sizes static pools; with HAVE_MALLOC it caps dynamic alloc.
 #define MAX_NR_HCI_CONNECTIONS        2
 
-// HIDS Client: max concurrent connections as Central
+// HIDS Host: max concurrent connections as Central
 // We connect to one slave at a time
-#define MAX_NR_HIDS_CLIENTS           1
+#define MAX_NR_HIDS_HOSTS             1
 #define MAX_NUM_HID_SERVICES          1
+
+// Battery Service Client (bug #3): one 3rd-party upstream (mouse) at a time.
+// Static pool instead of malloc, same as the HIDS host above.
+#define MAX_NR_BATTERY_SERVICE_CLIENTS 1
 
 #endif // BTSTACK_CONFIG_H

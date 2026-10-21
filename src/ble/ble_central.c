@@ -23,19 +23,20 @@
 // ble_central.c — central/upstream role (Core 1 only, R7 split)
 //
 // Scanning, connect/reconnect (+timeouts), US-reconnect retry while the DS
-// host hasn't subscribed yet, hids_client (HID-over-GATT) handling, upstream
+// host hasn't subscribed yet, hids_host (HID-over-GATT) handling, upstream
 // HID descriptor parsing (hid_parser → g_ble_upstream_map).
 //
 
 #include "ble_manager.h"
 #include "ble_internal.h"
+#include "ble/le_device_db.h"
 #include "ipc/ipc_core.h"
 #include "config/cmk_config.h"
 #include "config/debug_config.h"
 #include "hid/hid_parser.h"
 
 #include "btstack.h"
-#include "ble/gatt-service/hids_client.h"
+#include "ble/gatt-service/hids_host.h"
 #include "hardware/gpio.h"
 
 #include <string.h>
@@ -75,18 +76,71 @@ static btstack_timer_source_t s_connect_timeout_timer;
 static btstack_timer_source_t s_us_reconnect_retry_timer;
 static uint32_t               s_us_reconnect_wait_start = 0;
 static bool                   s_us_reconnect_deferred   = false;
+static bool s_pair_lookup_pending;
+static bool s_cancel_pending;
 
-static void hids_client_handler(uint8_t ptype, uint16_t ch, uint8_t *pkt, uint16_t sz);
+// Bug #4 proof: how long the Initiating state really lasted before the peer was
+// caught. Paired with the peripheral's "[ADV] finestra ... chiusa dopo N ms" on
+// the other half, this shows whether the two windows actually overlap.
+static uint32_t s_initiating_start_ms;
+
+// Bug #12 — the pending-lookup latch must never outlive the lookup itself.
+// While it is set, ble_central_on_adv_report() drops EVERY advertisement; a
+// resolution whose completion never reaches our handler (SM busy with a
+// connection-bound resolution, filtered event, candidate gone) used to leave the
+// scan running but DEAF for the rest of the window — the user had to press the
+// discover key a second time. The latch is now armed together with a watchdog
+// and the two are always cleared as a pair.
+#define PAIR_LOOKUP_TIMEOUT_MS 1000
+static btstack_timer_source_t s_pair_lookup_timer;
+
+// Bug #12 — a candidate that resolves to the ACTIVE downstream is rejected; skip
+// it on its next advertisement, otherwise the scan re-picks the same device for
+// the whole window. Advertised (possibly resolvable-private) address: after a
+// rotation the peer is re-evaluated, which is the desired behaviour anyway.
+static bd_addr_t      s_skip_addr;
+static bd_addr_type_t s_skip_addr_type;
+static bool           s_skip_valid;
+
+
+static void hids_host_handler(uint8_t ptype, uint16_t ch, uint8_t *pkt, uint16_t sz);
 static void central_connect(void);
 static void scan_timeout_handler(btstack_timer_source_t *ts);
 static void connect_timeout_handler(btstack_timer_source_t *ts);
+
+// ---------------------------------------------------------------------------
+// Pending identity-lookup latch (bug #12)
+// ---------------------------------------------------------------------------
+
+static void pair_lookup_clear(void) {
+    btstack_run_loop_remove_timer(&s_pair_lookup_timer);
+    s_pair_lookup_pending = false;
+}
+
+// Watchdog: no resolution outcome reached us in time → un-deafen the scan. The
+// same advertiser will simply be re-evaluated on its next advertisement.
+static void pair_lookup_timeout_handler(btstack_timer_source_t *ts) {
+    UNUSED(ts);
+    if (!s_pair_lookup_pending) return;
+    s_pair_lookup_pending = false;
+    C1_DBG_STATUS("[CENTRAL] Identity lookup senza esito entro %d ms - scan riattivo\n",
+                  PAIR_LOOKUP_TIMEOUT_MS);
+}
+
+static void pair_lookup_arm(void) {
+    s_pair_lookup_pending = true;
+    btstack_run_loop_remove_timer(&s_pair_lookup_timer);
+    s_pair_lookup_timer.process = &pair_lookup_timeout_handler;
+    btstack_run_loop_set_timer(&s_pair_lookup_timer, PAIR_LOOKUP_TIMEOUT_MS);
+    btstack_run_loop_add_timer(&s_pair_lookup_timer);
+}
 
 // ---------------------------------------------------------------------------
 // Init
 // ---------------------------------------------------------------------------
 
 void ble_central_init(void) {
-    hids_client_init(s_hid_descriptor_storage, sizeof(s_hid_descriptor_storage));
+    hids_host_init(s_hid_descriptor_storage, sizeof(s_hid_descriptor_storage));
 }
 
 // ---------------------------------------------------------------------------
@@ -99,6 +153,7 @@ static void scan_timeout_handler(btstack_timer_source_t *ts) {
     if (g_ble_central_state != CENTRAL_SCANNING) return;  // already connecting/connected, ignore
     C1_DBG_STATUS("[CENTRAL] Scan timeout — stopping\n");
     gap_stop_scan();
+    pair_lookup_clear();
     g_ble_central_state = CENTRAL_IDLE;
     ipc_push_to_core0(IPC_ENCODE(IPC_CENTRAL_SCAN_TIMEOUT, 0));
 }
@@ -118,11 +173,13 @@ static void connect_timeout_handler(btstack_timer_source_t *ts) {
 // ---------------------------------------------------------------------------
 
 void central_start_scanning(void) {
-    if (g_ble_central_state != CENTRAL_IDLE) {
+    if (s_cancel_pending || g_ble_central_state != CENTRAL_IDLE) {
         C1_DBG_STATUS("[CENTRAL] Cannot scan: state=%d (not IDLE)\n", g_ble_central_state);
         ipc_push_to_core0(IPC_ENCODE(IPC_CMD_REJECTED, IPC_START_SCAN));   // R4 NACK
         return;
     }
+    pair_lookup_clear();
+    s_skip_valid = false;          // bug #12: fresh window, no candidate skipped
     // Use fixed central address for upstream operations (distinct from DS slot addresses)
     if (g_ble_slot_addrs_ready) gap_random_address_set(g_ble_central_random_addr);
     gap_stop_scan();  // defensive: clear any lingering scan
@@ -211,6 +268,7 @@ void central_reconnect(void) {
         return;
     }
     g_ble_central_state = CENTRAL_CONNECTING;
+    s_initiating_start_ms = btstack_run_loop_get_time_ms();
     // No timeout — controller keeps trying forever until upstream appears
     ipc_push_to_core0(IPC_ENCODE(IPC_CENTRAL_FOUND, 0));
     C1_DBG_STATUS("[CENTRAL] Reconnecting to %s (forever, no timeout)...\n",
@@ -235,7 +293,7 @@ void ble_central_cancel_deferred_reconnect(void) {
 // Start HID-over-GATT discovery on the connected upstream.
 // Called after pairing complete / re-encryption complete (SM handler).
 void ble_central_start_hid_discovery(void) {
-    hids_client_connect(g_ble_central_handle, hids_client_handler,
+    hids_host_connect(g_ble_central_handle, hids_host_handler,
                         HID_PROTOCOL_MODE_REPORT, &s_hids_cid);
 }
 
@@ -249,23 +307,28 @@ void ble_central_start_hid_discovery(void) {
 void ble_central_disconnect(void) {
     btstack_run_loop_remove_timer(&s_us_reconnect_retry_timer);
     s_us_reconnect_deferred = false;
+    pair_lookup_clear();
     if (g_ble_central_handle != HCI_CON_HANDLE_INVALID) {
         // Connected (DISCOVERING/CONNECTED): drop the HID client first (avoids
         // a context leak), then the link. The HCI disconnect handler notifies
         // Core 0 with IPC_CENTRAL_DISCONNECTED.
-        if (s_hids_cid != 0) { hids_client_disconnect(s_hids_cid); s_hids_cid = 0; }
+        if (s_hids_cid != 0) { hids_host_disconnect(s_hids_cid); s_hids_cid = 0; }
+        ble_batt_on_central_disconnect();
         gap_disconnect(g_ble_central_handle);
         C1_DBG_STATUS("[CENTRAL] Disconnect richiesto da Core 0\n");
     } else if (g_ble_central_state == CENTRAL_CONNECTING) {
+        s_cancel_pending=true;
+        btstack_run_loop_remove_timer(&s_connect_timeout_timer);
         gap_connect_cancel();
-        g_ble_central_state = CENTRAL_IDLE;
-        // The CYW43 may swallow the cancel completion — notify Core 0 directly.
-        ipc_push_to_core0(IPC_ENCODE(IPC_CENTRAL_DISCONNECTED, 0));
+        // Remain CONNECTING until the controller completes cancellation.
+        // Starting scan early races the old connection-complete event.
         C1_DBG_STATUS("[CENTRAL] Connect cancellato da Core 0\n");
     } else if (g_ble_central_state == CENTRAL_SCANNING) {
         gap_stop_scan();
         btstack_run_loop_remove_timer(&s_scan_timeout_timer);
         g_ble_central_state = CENTRAL_IDLE;
+        ipc_push_to_core0(IPC_ENCODE(IPC_CENTRAL_DISCONNECTED, 0));
+    } else {
         ipc_push_to_core0(IPC_ENCODE(IPC_CENTRAL_DISCONNECTED, 0));
     }
 }
@@ -276,15 +339,26 @@ void ble_central_disconnect(void) {
 
 // GAP_SUBEVENT_LE_CONNECTION_COMPLETE, role == MASTER, status == SUCCESS
 void ble_central_on_connected(hci_con_handle_t handle) {
+    if (s_initiating_start_ms) {
+        C1_DBG_STATUS("[INIT] agganciato dopo %lu ms di Initiating\n",
+                      (unsigned long)(btstack_run_loop_get_time_ms() - s_initiating_start_ms));
+        s_initiating_start_ms = 0;
+    }
     g_ble_central_handle = handle;
     g_ble_central_state  = CENTRAL_DISCOVERING;
+    if (s_cancel_pending) {
+        // Connect won the cancel race: tear down the real link, do not pair.
+        gap_disconnect(handle);
+        return;
+    }
     // Cancel connect timeout — upstream responded
     btstack_run_loop_remove_timer(&s_connect_timeout_timer);
     // Note: advertising is NOT paused — CYW43 handles concurrent adv + GATT.
     // Pausing caused a state inconsistency bug where advertising could
     // get stuck disabled when periph_start_advertising() saw PERIPH_ADVERTISING
     // and returned early without calling gap_advertisements_enable(1).
-    C1_DBG_STATUS("[CENTRAL] Upstream connected (handle=0x%04x) — pairing...\n", handle);
+    C1_DBG_STATUS("[CENTRAL] Upstream connected (handle=0x%04x) addr=%s type=%u — pairing...\n",
+                  handle,bd_addr_to_str(s_central_addr),s_central_addr_type);
     sm_request_pairing(handle);
     // gap_connect_cancel() raced with connection completion — the cancel
     // didn't take effect.  Execute deferred ADV now (CYW43 supports
@@ -296,6 +370,7 @@ void ble_central_on_connected(hci_con_handle_t handle) {
 // Central connection attempt failed or was cancelled (e.g. gap_connect_cancel
 // returns status=0x02 Unknown_Connection_Identifier).
 void ble_central_on_conn_failed(uint8_t status) {
+    s_cancel_pending=false;
     g_ble_central_handle = HCI_CON_HANDLE_INVALID;
     g_ble_central_state  = CENTRAL_IDLE;
     btstack_run_loop_remove_timer(&s_connect_timeout_timer);
@@ -307,6 +382,7 @@ void ble_central_on_conn_failed(uint8_t status) {
 
 // HCI_EVENT_DISCONNECTION_COMPLETE for the upstream connection
 void ble_central_on_disconnected(uint8_t reason) {
+    s_cancel_pending=false;
     C1_DBG_STATUS("[CENTRAL] Upstream disconnected (reason=0x%02x)\n", reason);
     g_ble_central_handle     = HCI_CON_HANDLE_INVALID;
     s_hids_cid               = 0;
@@ -315,6 +391,7 @@ void ble_central_on_disconnected(uint8_t reason) {
     // Split: the upstream was our slave → abort discovery and fall back to
     // STANDALONE (Milestone D will also release any stale remote keys).
     ble_split_on_central_disconnect();
+    ble_batt_on_central_disconnect();   // bug #3: peer/mouse SoC → unknown
 #ifdef PIN_LED_RELAY
     gpio_put(PIN_LED_RELAY, 0);
 #endif
@@ -326,26 +403,76 @@ void ble_central_on_disconnected(uint8_t reason) {
     // Press FN+GP13 to reconnect upstream
 }
 
+// Fresh scan is explicit user intent. Resolve advertised/private addresses
+// before deleting exactly that candidate's bond; never enumerate/purge all DB.
+bool ble_central_pairing_identity_event(const uint8_t *packet) {
+    uint8_t event=hci_event_packet_get_type(packet);
+    bool success=event==SM_EVENT_IDENTITY_RESOLVING_SUCCEEDED;
+    if (!success && event!=SM_EVENT_IDENTITY_RESOLVING_FAILED) return false;
+    if (!s_pair_lookup_pending || g_ble_central_state!=CENTRAL_SCANNING) return false;
+    bd_addr_t addr;
+    sm_event_identity_resolving_failed_get_address(packet,addr);
+    if (sm_event_identity_resolving_failed_get_addr_type(packet)!=s_central_addr_type ||
+        memcmp(addr,s_central_addr,6)) return false;
+    // Connection-bound resolution belongs to SM, not our explicit lookup.
+    if (sm_event_identity_resolving_failed_get_handle(packet)!=HCI_CON_HANDLE_INVALID) return false;
+    pair_lookup_clear();
+    if (success) {
+        int index=sm_event_identity_resolving_succeeded_get_index(packet);
+        if (g_ble_periph_handle!=HCI_CON_HANDLE_INVALID && index==sm_le_device_index(g_ble_periph_handle)) {
+            C1_DBG_STATUS("[SM] Pair candidate is active downstream: ignored\n");
+            // Bug #12: remember it, or its next advertisement re-enters here and
+            // the scan window burns on the same device without ever connecting.
+            memcpy(s_skip_addr, s_central_addr, sizeof(bd_addr_t));
+            s_skip_addr_type = s_central_addr_type;
+            s_skip_valid     = true;
+            return true;
+        }
+        bd_addr_t identity;
+        sm_event_identity_resolving_succeeded_get_identity_address(packet,identity);
+        uint8_t type=sm_event_identity_resolving_succeeded_get_identity_addr_type(packet);
+        C1_DBG_STATUS("[SM] Explicit upstream pairing: delete identity=%s type=%u db=%d\n",
+                      bd_addr_to_str(identity),type,index);
+        gap_delete_bonding((bd_addr_type_t)type,identity);
+    } else {
+        C1_DBG_STATUS("[SM] Explicit upstream pairing: candidate has no local bond\n");
+    }
+    central_connect();
+    return true;
+}
+
 // GAP_EVENT_ADVERTISING_REPORT — pick the first HID device found
 void ble_central_on_adv_report(uint8_t *pkt) {
-    if (g_ble_central_state != CENTRAL_SCANNING) return;
+    if (g_ble_central_state != CENTRAL_SCANNING || s_pair_lookup_pending) return;
     const uint8_t *ad_data = gap_event_advertising_report_get_data(pkt);
     uint8_t        ad_len  = gap_event_advertising_report_get_data_length(pkt);
     if (!ad_data_contains_uuid16(ad_len, ad_data,
                                  ORG_BLUETOOTH_SERVICE_HUMAN_INTERFACE_DEVICE)) return;
-    gap_event_advertising_report_get_address(pkt, s_central_addr);
-    s_central_addr_type = gap_event_advertising_report_get_address_type(pkt);
-    C1_DBG_STATUS("[CENTRAL] Found HID device: %s\n", bd_addr_to_str(s_central_addr));
-    central_connect();
+    bd_addr_t      addr;
+    bd_addr_type_t addr_type;
+    gap_event_advertising_report_get_address(pkt, addr);
+    addr_type = gap_event_advertising_report_get_address_type(pkt);
+    // Bug #12: a candidate already rejected in THIS window (active downstream)
+    // would otherwise be re-picked on every one of its advertisements.
+    if (s_skip_valid && addr_type == s_skip_addr_type &&
+        memcmp(addr, s_skip_addr, sizeof(bd_addr_t)) == 0) return;
+    memcpy(s_central_addr, addr, sizeof(bd_addr_t));
+    s_central_addr_type = addr_type;
+    C1_DBG_STATUS("[CENTRAL] Found HID device: %s type=%u; resolve identity before fresh pairing\n",
+                  bd_addr_to_str(s_central_addr),s_central_addr_type);
+    pair_lookup_arm();
+    if (sm_address_resolution_lookup(s_central_addr_type,s_central_addr)!=0) {
+        pair_lookup_clear(); // lookup busy: next advertisement retries
+    }
 }
 
 // ---------------------------------------------------------------------------
 // HIDS Client handler (central — upstream)
 // ---------------------------------------------------------------------------
 
-static void hids_client_handler(uint8_t ptype, uint16_t ch, uint8_t *pkt, uint16_t sz) {
+static void hids_host_handler(uint8_t ptype, uint16_t ch, uint8_t *pkt, uint16_t sz) {
     UNUSED(ch); UNUSED(sz); UNUSED(ptype);
-    // NOTE: hids_client calls this handler with ptype=HCI_EVENT_PACKET for connection events
+    // NOTE: hids_host calls this handler with ptype=HCI_EVENT_PACKET for connection events
     // but with ptype=HCI_EVENT_GATTSERVICE_META for notifications (handle_notification_event).
     // Do NOT filter on ptype — check only the packet content.
     if (hci_event_packet_get_type(pkt) != HCI_EVENT_GATTSERVICE_META) return;
@@ -360,8 +487,8 @@ static void hids_client_handler(uint8_t ptype, uint16_t ch, uint8_t *pkt, uint16
 
             // Parse upstream HID descriptor so the mouse relay can handle any format
             g_ble_upstream_map_valid = false;
-            const uint8_t *up_desc = hids_client_descriptor_storage_get_descriptor_data(s_hids_cid, 0);
-            uint16_t       up_len  = hids_client_descriptor_storage_get_descriptor_len(s_hids_cid, 0);
+            const uint8_t *up_desc = hids_host_descriptor_storage_get_descriptor_data(s_hids_cid, 0);
+            uint16_t       up_len  = hids_host_descriptor_storage_get_descriptor_len(s_hids_cid, 0);
             if (up_desc && up_len > 0) {
                 int n = hid_parse_descriptor(up_desc, up_len, &g_ble_upstream_map);
                 g_ble_upstream_map_valid = (n >= 0);
@@ -390,12 +517,12 @@ static void hids_client_handler(uint8_t ptype, uint16_t ch, uint8_t *pkt, uint16
 
             // Phase 18: probe the upstream for the CMK-Split service. If present,
             // it is a sibling half → we become MASTER and subscribe to its matrix
-            // events. The hids_client has finished its discovery, so the gatt_client
+            // events. The hids_host has finished its discovery, so the gatt_client
             // is free now. (No-op for a 3rd-party HID upstream → stay STANDALONE.)
             split_start_discovery();
         } else {
             C1_DBG_STATUS("[CENTRAL] HID connect failed (0x%02x)\n", status);
-            if (s_hids_cid != 0) { hids_client_disconnect(s_hids_cid); s_hids_cid = 0; }
+            if (s_hids_cid != 0) { hids_host_disconnect(s_hids_cid); s_hids_cid = 0; }
             gap_disconnect(g_ble_central_handle);
         }
         break;
@@ -426,7 +553,7 @@ static void hids_client_handler(uint8_t ptype, uint16_t ch, uint8_t *pkt, uint16
         uint16_t       report_len = gattservice_subevent_hid_report_get_report_len(pkt);
         uint8_t        report_id  = gattservice_subevent_hid_report_get_report_id(pkt);
 
-        // BTstack hids_client prepends the Report ID as report[0].
+        // BTstack hids_host prepends the Report ID as report[0].
         // hids_device_send_input_report_for_id() sends raw data WITHOUT Report ID prefix
         // (the downstream BLE host knows the Report ID from the GATT characteristic's
         // Report Reference descriptor). Strip byte[0] before relaying.

@@ -48,7 +48,7 @@
 // ---------------------------------------------------------------------------
 
 #define EECONFIG_MAGIC_VAL  0xEC01u
-#define EECONFIG_VERSION    7
+#define EECONFIG_VERSION    8
 #define EECONFIG_ADDR       0x0100u
 
 typedef struct __attribute__((packed)) {
@@ -58,7 +58,11 @@ typedef struct __attribute__((packed)) {
     uint16_t keymap_flags;    // magic swap bitmask
     uint8_t  auto_shift_on;
     uint8_t  unicode_mode;
-    uint32_t keyboard;        // keyboard-specific blob
+    // Bug #8: tapping term runtime (ms; 0 = factory default TAPPING_TERM),
+    // ricavato dall'ex blob `keyboard` (mai scritto → 0 su tutti i record v8:
+    // stesso layout/offset, niente version bump).
+    uint16_t tapping_term;
+    uint8_t  _reserved2[2];   // ex "keyboard" blob, byte alti
     uint32_t user;            // user-specific blob
     // Phase 13: RGB base config (6 bytes)
     uint8_t  rgb_enable;
@@ -76,7 +80,12 @@ typedef struct __attribute__((packed)) {
     uint8_t  output_target;   // output_target_t: 0=USB, 1=BLE (factory default = USB)
     // Phase 20b: split config mode (0=two independent halves, 1=unified split view)
     uint8_t  split_mode;      // factory default = 0 (off)
-    uint8_t  _reserved[4];    // future use (total = 32 bytes)
+    // v8 (bug #2): Low Power Mode idle timeouts in SECONDS, 0 = tier disabled.
+    // Runtime source for low_power.c; factory defaults from LP_*_IDLE_MS.
+    // The DEEP value is also the window power_veto()/power_request() use, so it
+    // doubles as the relayed-HID hold that keeps the radio up (bug #1).
+    uint16_t lp_light_s;
+    uint16_t lp_deep_s;       // (total = 32 bytes)
 } eeconfig_t;
 
 _Static_assert(sizeof(eeconfig_t) == 32, "eeconfig_t must be 32 bytes");
@@ -113,6 +122,9 @@ static void cache_defaults(void) {
     s_cache.rgb_wave_width = RGB_DEFAULT_WAVE_WIDTH;
     s_cache.rgb_fade       = RGB_DEFAULT_FADE;
     s_cache.rgb_hue_shift  = RGB_DEFAULT_HUE_SHIFT;
+    // Low Power timeouts (v8) — seconds
+    s_cache.lp_light_s     = (uint16_t)(LP_LIGHT_IDLE_MS / 1000u);
+    s_cache.lp_deep_s      = (uint16_t)(LP_DEEP_IDLE_MS / 1000u);
 }
 
 static void store_flush(void) {
@@ -161,6 +173,11 @@ void eeconfig_init(void) {
         s_cache.rgb_hue_shift  = RGB_DEFAULT_HUE_SHIFT;
         // Phase 14 ext: default output destination = USB (0)
         s_cache.output_target  = 0;
+        // v8 (bug #2): these bytes were `_reserved` and read back as 0, which
+        // here means "tier disabled" — seed them with the factory defaults
+        // instead, or a migrated keyboard would silently lose LIGHT and DEEP.
+        s_cache.lp_light_s     = (uint16_t)(LP_LIGHT_IDLE_MS / 1000u);
+        s_cache.lp_deep_s      = (uint16_t)(LP_DEEP_IDLE_MS / 1000u);
         s_eeprom_ok = true;
         store_flush();
         DBG_MEM("[EECONFIG] migrated v%u → v%u (re-applied RGB defaults)\n",
@@ -244,16 +261,16 @@ void eeconfig_update_unicode_mode(uint8_t mode) {
 }
 
 // ---------------------------------------------------------------------------
-// Keyboard blob
+// Tapping term (bug #8) — ms, 0 = factory default (TAPPING_TERM)
 // ---------------------------------------------------------------------------
 
-uint32_t eeconfig_read_keyboard(void) {
-    return s_cache.keyboard;
+uint16_t eeconfig_read_tapping_term(void) {
+    return s_cache.tapping_term;
 }
 
-void eeconfig_update_keyboard(uint32_t val) {
-    if (s_cache.keyboard == val) return;
-    s_cache.keyboard = val;
+void eeconfig_update_tapping_term(uint16_t ms) {
+    if (s_cache.tapping_term == ms) return;
+    s_cache.tapping_term = ms;
     store_flush();
 }
 
@@ -297,6 +314,30 @@ void eeconfig_update_split_mode(uint8_t on) {
     on = on ? 1 : 0;
     if (s_cache.split_mode == on) return;
     s_cache.split_mode = on;
+    store_flush();
+}
+
+// ---------------------------------------------------------------------------
+// Low Power timeouts (v8, bug #2) — seconds, 0 = tier disabled
+// ---------------------------------------------------------------------------
+
+uint16_t eeconfig_read_lp_light_s(void) {
+    return s_cache.lp_light_s;
+}
+
+void eeconfig_update_lp_light_s(uint16_t seconds) {
+    if (s_cache.lp_light_s == seconds) return;
+    s_cache.lp_light_s = seconds;
+    store_flush();
+}
+
+uint16_t eeconfig_read_lp_deep_s(void) {
+    return s_cache.lp_deep_s;
+}
+
+void eeconfig_update_lp_deep_s(uint16_t seconds) {
+    if (s_cache.lp_deep_s == seconds) return;
+    s_cache.lp_deep_s = seconds;
     store_flush();
 }
 

@@ -61,14 +61,16 @@
 // Tapping (Phase 7 — Mod-Tap / Layer-Tap)
 // ---------------------------------------------------------------------------
 
-#define TAPPING_TERM        200   // ms — hold threshold for MT() and LT()
+#define TAPPING_TERM        200   // ms — FACTORY DEFAULT hold threshold for MT()/LT()/TD():
+                                  // il valore runtime vive in eeconfig (tapping_term,
+                                  // 0 = questo default) via SET_SETTING 0x08 — bug #8
+#define TAPPING_TERM_MIN     50   // clamp firmware-side del valore runtime
+#define TAPPING_TERM_MAX   1000
 #define TAPPING_BUFFER_SIZE   8   // max buffered events during tap/hold resolution
 
-// tap_code (non-blocking tap emitter): press and release are emitted this many ms
-// apart, on separate keyscan ticks. Must be ≥ one BLE connection interval (~15 ms)
-// so the press is transmitted before the release overwrites the last-wins IPC slot;
-// it is also the press duration AND the gap between queued taps → caps the tap rate
-// at ~1000/(2*DELAY) ≈ 25/s. Lower = snappier (USB-safe) but risks dropped BLE taps.
+// Delayed tap_code emitter (Auto Shift / Tap Dance / Space Cadet): press duration
+// and inter-tap gap, keeping its existing ~25 taps/s timing. MT/LT emit ordered
+// report snapshots immediately before replay and do not use this delay.
 #define TAP_CODE_DELAY_MS    20
 #define TAP_CODE_QUEUE_SIZE  16   // pending taps buffered during fast bursts
 
@@ -96,6 +98,7 @@
 
 #define HID_REPORT_ID_KEYBOARD  1
 #define HID_REPORT_ID_MOUSE     2
+#define HID_REPORT_ID_CONSUMER  4    // bug #6: 16-bit Consumer usage (2B report)
 
 // ---------------------------------------------------------------------------
 // BLE timeout (BTstack timer in Core 1)
@@ -104,6 +107,49 @@
 #define ADV_TIMEOUT_MS        10000   // stop advertising if no downstream connects in 10 s
 #define SCAN_TIMEOUT_MS       10000   // stop scanning if no upstream found in 10 s
 #define CONNECT_TIMEOUT_MS    10000   // abort gap_connect() if upstream doesn't respond in 10 s
+
+// Connection interval for EVERY BLE link, in 1.25 ms units (6 = 7.5 ms, the
+// BLE minimum). ble_link_policy.c imposes it on links where we are master
+// (upstream mouse, inter-half link on the master half) whatever the peer asks,
+// keeping the peer's latency, and asks the downstream host for it with
+// fallbacks (11.25 ms, then 7.5–15 ms) since there we can only request.
+//
+// Why one value everywhere: the relaying half's radio drops inter-half events
+// that overlap the mouse link's, and mismatched intervals either spread that
+// loss (coprime: steady stutter) or latch it for minutes (harmonic). Measured
+// in docs/Mouse_Lag_Investigation.md §11-21: 15 ms everywhere was steady but
+// less fluid, 7.5 ms everywhere steady and fluid. The controller also picks a
+// harmonic interval for its own links when given a range, so a value must be
+// imposed on both ends, not requested once.
+#define BLE_LINK_INTERVAL     6       // 7.5 ms
+
+// Inter-half link, applied by the MASTER half on split engage (ble_split.c).
+#define SPLIT_LINK_INTERVAL   BLE_LINK_INTERVAL
+
+// Max ACL packets allowed in flight on the downstream link (handed to the
+// controller, Number-Of-Completed-Packets not yet received) before the relay
+// stops popping upstream mouse reports. Held-back motion keeps coalescing in
+// the relay queue and ships as soon as the controller retires a packet.
+//
+// Without it every CAN_SEND_NOW pops a report, so when the link's capacity
+// drops the controller's 8 LE buffers fill with stale motion: measured 8 in
+// flight 97% of the time at ~28 pkt/s ≈ 285 ms of cursor lag, which the relay
+// can no longer coalesce. With 2 the backlog is bounded to ~2 packets whatever
+// the link does, at the cost of a lower update rate while it is degraded.
+// 0 disables the cap (b015 behaviour). See docs/Mouse_Lag_Investigation.md §14.
+#define RELAY_MOUSE_INFLIGHT_MAX  2
+
+// ...but the cap engages only once the link is actually slow: the oldest mouse
+// report still in flight is older than this many milliseconds (b017: 3
+// downstream intervals, i.e. 41 ms / 45 ms; in ms so a shorter inter-half
+// interval does not make it bite early). A packet needs 1-2 intervals just to
+// be sent and acked (the peer
+// acks at its next event), so an unconditional cap of 2 starved a working link:
+// b016 measured 43 mouse pkt/s shipped of 80 received, 60/s held back, ~37 ms
+// per packet in the controller, while b015 without the cap shipped everything.
+// While packets complete in time the relay feeds the controller freely.
+// 0 = always capped (b016 behaviour).
+#define RELAY_MOUSE_SLOW_MS  45
 
 // ---------------------------------------------------------------------------
 // Keyscan task
@@ -125,6 +171,11 @@
 // radio off and sleep until a column GPIO edge (any key). The __wfi idle hook
 // (vApplicationIdleHook) is the always-on baseline below all tiers.
 #define LOW_POWER_ENABLE
+// LP_*_IDLE_MS are the FACTORY DEFAULTS only (bug #2): the values in force live
+// in eeconfig (lp_light_s/lp_deep_s, seconds, 0 = tier disabled) and are set at
+// runtime with the Config Protocol (SET_SETTING 0x06/0x07), applied without a
+// reboot. The DEEP value is also the window the power policy uses for the
+// relayed-HID hold, so raising it also keeps the radio up longer under traffic.
 #define LP_LIGHT_IDLE_MS    60000u    // 60 s  → LEDs off + keyscan throttle
 #define LP_DEEP_IDLE_MS    300000u    // 5 min → radio off + GPIO-IRQ deep sleep
 #define LP_LIGHT_SCAN_MS       10u    // throttled scan period in LIGHT/DEEP (1 kHz → 100 Hz)
@@ -312,6 +363,10 @@
 // flicker. NOT max priority: that hung boot during Core 1 CYW43/BTstack bringup.
 #define USB_TASK_PRIORITY   2
 
+// Ordered keyboard snapshots: a tap/hold replay can emit several reports in
+// one scan, while the USB endpoint accepts only one transfer at a time.
+#define USB_KBD_QUEUE_SIZE 32
+
 #define RAW_HID_BUFFER_SIZE 32              // bytes per raw HID packet
 // (R7: il ring buffer raw HID in ingresso è stato rimosso — la consegna è solo
 // via callback sincrona; RAW_HID_QUEUE_DEPTH non esiste più.)
@@ -323,7 +378,7 @@
 // ---------------------------------------------------------------------------
 // Runtime-editable keymap persisted on EEPROM, configured over Raw HID (USB).
 // See src/core0/core/dynamic_keymap.{h,c}, src/usb/cmk_config_protocol.{h,c},
-// and CMK_Config_Protocol.md. Requires RAW_HID_ENABLE.
+// and CMK_Protocol.md. Requires RAW_HID_ENABLE.
 
 #define DYNAMIC_KEYMAP_ENABLE               // keymap stored in / loaded from EEPROM at runtime
 
@@ -331,7 +386,19 @@
 #define DYNAMIC_KEYMAP_MAGIC    0x4B44u     // 'DK' — region header magic
 #define DYNAMIC_KEYMAP_VERSION  2           // v2 (Fase 18): unified 4×12 keymap (1152 B)
 
-#define CMK_PROTOCOL_VERSION    0x0004      // CMK Config Protocol spec version implemented
+// ---------------------------------------------------------------------------
+// Phase 15e — Macro storage (VIA-style byte stream on EEPROM, protocol 0x4x)
+// ---------------------------------------------------------------------------
+
+#define MACRO_STORAGE_ENABLE
+#define MACRO_STORAGE_ADDR      0x4000      // EEPROM region base (1KB buffer + 4B header)
+#define MACRO_STORAGE_MAGIC     0x434Du     // 'MC' — region header magic
+#define MACRO_STORAGE_VERSION   1
+#define MACRO_COUNT             16          // MACRO(0..15)
+#define MACRO_BUFFER_SIZE       1024        // bytes, all macros concatenated (NUL-terminated)
+#define MACRO_PLAY_DELAY        10          // ms per playback step (press/release phase)
+
+#define CMK_PROTOCOL_VERSION    0x0005      // CMK Config Protocol spec version implemented
                                             // v2: RGB commands gained a per-half `target`
                                             // v3: uniform `target` byte at req[1] on EVERY command
                                             //     (args shift to req[2]); centralised per-side routing
@@ -339,6 +406,13 @@
                                             // v4 (additive, framing unchanged): GET_DIAG (0x04) +
                                             //     ST_OK_LOCAL_ONLY (0x08) for BOTH writes with
                                             //     peer not joined (was a silent ST_OK in v3).
+                                            // v5 (additive, framing unchanged): SET_SETTING ids
+                                            //     0x06/0x07 (LP light/deep timeout, seconds,
+                                            //     0=disabled) + GET_SETTINGS d[7..10] (LE16 x2)
+                                            //     + GET_BATTERY (0x05, bug #3) + SET_SETTING 0x08
+                                            //     tapping term (GET_SETTINGS d[11..12], bug #8)
+                                            //     + macro storage 0x41/0x43/0x44/0x4F (Phase 15e,
+                                            //     feature bit4, bug #5) + Consumer keycodes (bug #6).
 
 // Magic token required by CMD_BOOTLOADER (0x0F) to actually reboot into the ROM
 // BOOTSEL. The configurator must send these 4 bytes (big-endian) at req[2..5];

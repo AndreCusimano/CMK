@@ -49,6 +49,7 @@
 #include "process_auto_shift.h"
 #include "process_leader.h"
 #include "process_dynamic_macro.h"
+#include "process_macro.h"
 #include "process_space_cadet.h"
 #include "process_grave_esc.h"
 #include "process_magic.h"
@@ -103,6 +104,7 @@ void action_init(void) {
     DBG_BOOT("[ACT]  auto_shift_init\n");             auto_shift_init();
     DBG_BOOT("[ACT]  leader_init\n");                 leader_init();
     DBG_BOOT("[ACT]  dynamic_macro_init\n");          dynamic_macro_init();
+    DBG_BOOT("[ACT]  macro_play_init\n");             macro_play_init();
     DBG_BOOT("[ACT]  space_cadet_init\n");            space_cadet_init();
     DBG_BOOT("[ACT]  grave_esc_init\n");              grave_esc_init();
     DBG_BOOT("[ACT]  magic_init\n");                  magic_init();
@@ -374,6 +376,7 @@ void action_tick(uint32_t now_ticks) {
     leader_tick(now_ticks);
     space_cadet_tick(now_ticks);
     dynamic_macro_tick(now_ticks);
+    macro_play_tick(now_ticks);   // Phase 15e: EEPROM macro playback
     wpm_tick(now_ticks);
     velocikey_tick(now_ticks);
     unicode_tick(now_ticks);

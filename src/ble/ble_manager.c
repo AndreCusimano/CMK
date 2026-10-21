@@ -27,7 +27,7 @@
 // dispatch to the role modules), the IPC command dispatch and the ATT
 // server callbacks. The actual role logic lives in:
 //   ble_periph.c  — advertising / downstream connection
-//   ble_central.c — scanning / upstream connection / hids_client
+//   ble_central.c — scanning / upstream connection / hids_host
 //   ble_split.c   — CMK-Split transport (Phase 18)
 //   ble_relay.c   — keyboard merge, mouse relay, CAN_SEND_NOW chain
 // Shared state and cross-module hooks: ble_internal.h.
@@ -35,6 +35,9 @@
 
 #include "ble_manager.h"
 #include "ble_internal.h"
+#include "ble_link_policy.h"
+#include "ble/le_device_db.h"
+#include "ble_power.h"
 #include "ipc/ipc_core.h"
 #include "config/cmk_config.h"
 #include "config/debug_config.h"
@@ -57,6 +60,76 @@
 // ---------------------------------------------------------------------------
 // HID report descriptor — composite: keyboard (Report ID 1) + mouse (Report ID 2)
 // ---------------------------------------------------------------------------
+
+// Last successful parameters survive the event ring; snapshots every second.
+static uint32_t s_trace_links[2][7];
+
+static void trace_link_event(const uint32_t event[7], int role) {
+    if ((event[0]==3 || event[0]==4) && (event[6]&255u)==0) {
+        int index=role;
+        if (index<0) {
+            index=s_trace_links[0][2]==event[2] ? 0 :
+                  s_trace_links[1][2]==event[2] ? 1 : -1;
+        }
+        if(index>=0 && index<2) {
+            memcpy(s_trace_links[index],event,7*sizeof(uint32_t));
+            s_trace_links[index][0]=6+(uint32_t)index;
+            s_trace_links[index][6]=1;
+            ble_link_policy_on_params((hci_con_handle_t)event[2],index==0,(uint16_t)event[3],
+                                      (uint16_t)event[4],(uint16_t)event[5]);
+        }
+    } else if(event[0]==5) {
+        for(unsigned i=0;i<2;i++) if(s_trace_links[i][2]==event[2]) s_trace_links[i][6]=0;
+        ble_link_policy_on_disconnect((hci_con_handle_t)event[2]);
+    }
+    ipc_trace_put(event);
+}
+// DS connection interval in microseconds, from the last link snapshot (0 when
+// the link is down). Used to express NOCP gaps in connection-interval units.
+uint32_t ble_manager_ds_interval_us(void) {
+    return s_trace_links[1][6] ? s_trace_links[1][3]*1250u : 0;
+}
+// Same for the upstream link (the mouse on the relaying half).
+uint32_t ble_manager_us_interval_us(void) {
+    return s_trace_links[0][6] ? s_trace_links[0][3]*1250u : 0;
+}
+
+void ble_manager_trace_links(void) {
+    for(unsigned i=0;i<2;i++) {
+        uint32_t event[7]; memcpy(event,s_trace_links[i],sizeof(event));
+        event[0]=6+i; event[1]=btstack_run_loop_get_time_ms();
+        ipc_trace_put(event);
+    }
+}
+
+// Parameter change asked BY the peer, before BTstack answers it against
+// gap_set_connection_parameter_range(): the L2CAP signaling request (slave →
+// master, what the M720 uses) and the LL Connection Parameter Request that the
+// controller forwards as an LE meta event. Record 17: handle, interval min, max
+// (1.25 ms units), latency, timeout (10 ms) | source<<16 (0 L2CAP, 1 LL) |
+// accepted<<24 (inside our range → BTstack grants it without asking us).
+static void trace_param_request(hci_con_handle_t handle,uint16_t min,uint16_t max,
+                                uint16_t latency,uint16_t timeout,uint32_t source) {
+    le_connection_parameter_range_t range;
+    gap_get_connection_parameter_range(&range);
+    uint32_t accepted=(uint32_t)gap_connection_parameter_range_included(&range,min,max,latency,timeout);
+    uint32_t record[7]={17,btstack_run_loop_get_time_ms(),handle,min,max,latency,
+                        timeout|(source<<16)|(accepted<<24)};
+    ipc_trace_put(record);
+}
+static void l2cap_param_request_handler(uint8_t type,uint16_t channel,uint8_t *pkt,uint16_t size) {
+    UNUSED(channel);
+    if(type!=HCI_EVENT_PACKET) return;
+    if(size>=6 && hci_event_packet_get_type(pkt)==L2CAP_EVENT_CONNECTION_PARAMETER_UPDATE_RESPONSE) {
+        ble_link_policy_on_ds_response(l2cap_event_connection_parameter_update_response_get_handle(pkt),
+                                       l2cap_event_connection_parameter_update_response_get_result(pkt));
+        return;
+    }
+    if(size<12 || hci_event_packet_get_type(pkt)!=L2CAP_EVENT_CONNECTION_PARAMETER_UPDATE_REQUEST) return;
+    trace_param_request(little_endian_read_16(pkt,2),little_endian_read_16(pkt,4),little_endian_read_16(pkt,6),
+                        little_endian_read_16(pkt,8),little_endian_read_16(pkt,10),0);
+}
+static btstack_packet_callback_registration_t s_l2cap_cb_reg;
 
 static const uint8_t hid_descriptor[] = {
     // --- Keyboard — Report ID 1 (8 bytes: modifier, reserved, 6 keycodes) ---
@@ -156,6 +229,24 @@ static const uint8_t hid_descriptor[] = {
     0x75, 0x01,        //   Report Size (1)
     0x81, 0x02,        //   Input (Data, Var, Abs)
     0xC0,              // End Collection
+
+    // --- Consumer Control — Report ID 4 (2 bytes: one 16-bit consumer usage) ---
+    // Media/volume/brightness/screen keys (bug #6). Array field: the host holds
+    // the reported usage until a 0x0000 report. Max 0x2FF covers AC Desktop
+    // Show All Windows (0x29F) and AL Launchpad (0x2A0) for macOS.
+    // Keep byte-for-byte identical to desc_hid_report_kbd[] in usb_descriptors.c.
+    0x05, 0x0C,        // Usage Page (Consumer)
+    0x09, 0x01,        // Usage (Consumer Control)
+    0xA1, 0x01,        // Collection (Application)
+    0x85, 0x04,        //   Report ID (4)
+    0x15, 0x00,        //   Logical Minimum (0)
+    0x26, 0xFF, 0x02,  //   Logical Maximum (0x2FF)
+    0x19, 0x00,        //   Usage Minimum (0)
+    0x2A, 0xFF, 0x02,  //   Usage Maximum (0x2FF)
+    0x75, 0x10,        //   Report Size (16)
+    0x95, 0x01,        //   Report Count (1)
+    0x81, 0x00,        //   Input (Data, Array, Abs)
+    0xC0,              // End Collection
 };
 
 // ---------------------------------------------------------------------------
@@ -166,8 +257,8 @@ bd_addr_t g_ble_slot_addr[NUM_DS_SLOTS];   // one random static addr per DS slot
 bd_addr_t g_ble_central_random_addr;       // fixed random static addr for central role (upstream)
 bool      g_ble_slot_addrs_ready = false;
 
-// Storage for composite HID device reports (3× Input + 1× Output + 1× Feature)
-static hids_device_report_t s_hid_report_storage[5];
+// Storage for composite HID device reports (4× Input + 1× Output + 1× Feature)
+static hids_device_report_t s_hid_report_storage[6];
 
 static btstack_packet_callback_registration_t s_hci_cb_reg;
 static btstack_packet_callback_registration_t s_sm_cb_reg;
@@ -240,12 +331,17 @@ static int att_write_cb(hci_con_handle_t con_handle, uint16_t attribute_handle,
 
 void ble_manager_init(void) {
     build_scan_response();   // bake the per-side device name into the scan response
-    // Central links (upstream mouse, inter-half) start at 7.5–15 ms / latency 0
-    // instead of the BTstack defaults (10–30 ms, latency 4): the mouse relay rate
-    // is capped by the slowest hop, and the slack interval starved it.
-    gap_set_connection_parameters(0x0060, 0x0030, 6, 12, 0, 400, 0, 0);
+    // Central links (upstream mouse, inter-half) start directly at
+    // BLE_LINK_INTERVAL / latency 0 instead of the BTstack defaults (10–30 ms,
+    // latency 4). min == max: given a range, the controller picks a value
+    // harmonic with its other links, not the fastest (ble_link_policy.c).
+    gap_set_connection_parameters(0x0060, 0x0030, BLE_LINK_INTERVAL, BLE_LINK_INTERVAL, 0, 400, 0, 0);
     l2cap_init();
     sm_init();
+    // BTstack 1.8 defaults to SC-only. Keep SC capability, but also allow
+    // BLE Legacy pairing for upstream HID devices (e.g. Logitech M720).
+    // Encryption key size remains the SDK default of 16 bytes.
+    sm_set_secure_connections_only_mode(false);
     sm_set_io_capabilities(IO_CAPABILITY_NO_INPUT_NO_OUTPUT);
     sm_set_authentication_requirements(SM_AUTHREQ_SECURE_CONNECTION | SM_AUTHREQ_BONDING);
     att_server_init(profile_data, att_read_cb, att_write_cb);
@@ -258,16 +354,22 @@ void ble_manager_init(void) {
                    ATT_CHARACTERISTIC_c3a50004_7a4e_4c1b_9b21_000000000001_01_VALUE_HANDLE,
                    ATT_CHARACTERISTIC_c3a50005_7a4e_4c1b_9b21_000000000001_01_VALUE_HANDLE,
                    ATT_CHARACTERISTIC_c3a50005_7a4e_4c1b_9b21_000000000001_01_CLIENT_CONFIGURATION_HANDLE,
-                   ATT_CHARACTERISTIC_c3a50006_7a4e_4c1b_9b21_000000000001_01_VALUE_HANDLE);
+                   ATT_CHARACTERISTIC_c3a50006_7a4e_4c1b_9b21_000000000001_01_VALUE_HANDLE,
+                   ATT_CHARACTERISTIC_c3a50010_7a4e_4c1b_9b21_000000000001_01_VALUE_HANDLE,
+                   ATT_CHARACTERISTIC_c3a50010_7a4e_4c1b_9b21_000000000001_01_CLIENT_CONFIGURATION_HANDLE,
+                   ATT_CHARACTERISTIC_c3a50007_7a4e_4c1b_9b21_000000000001_01_VALUE_HANDLE);
     battery_service_server_init(100);
+    ble_batt_init();         // bug #3: upstream mouse battery client
     device_information_service_server_init();
     hids_device_init_with_storage(0, hid_descriptor, sizeof(hid_descriptor),
-                                  5, s_hid_report_storage);
+                                  6, s_hid_report_storage);
     gatt_client_init();
-    ble_central_init();      // hids_client + upstream HID descriptor storage
+    ble_central_init();      // hids_host + upstream HID descriptor storage
 
     s_hci_cb_reg.callback = &hci_event_handler;
     hci_add_event_handler(&s_hci_cb_reg);
+    s_l2cap_cb_reg.callback = &l2cap_param_request_handler;
+    l2cap_add_event_handler(&s_l2cap_cb_reg);
 
     s_sm_cb_reg.callback = &sm_event_handler;
     sm_add_event_handler(&s_sm_cb_reg);
@@ -349,7 +451,28 @@ static void hci_event_handler(uint8_t ptype, uint16_t ch, uint8_t *pkt, uint16_t
             hci_con_handle_t handle = gap_subevent_le_connection_complete_get_connection_handle(pkt);
             uint8_t          status = gap_subevent_le_connection_complete_get_status(pkt);
 
-            if (role == HCI_ROLE_SLAVE && status != ERROR_CODE_SUCCESS) {
+            uint32_t trace[7]={3,btstack_run_loop_get_time_ms(),handle,
+                status ? 0 : gap_subevent_le_connection_complete_get_conn_interval(pkt),
+                status ? 0 : gap_subevent_le_connection_complete_get_conn_latency(pkt),
+                status ? 0 : gap_subevent_le_connection_complete_get_supervision_timeout(pkt),
+                ((uint32_t)role<<8)|status};
+            trace_link_event(trace,role);
+            // Bug #4: a DIRECTED ADVERTISING TIMEOUT (0x3C) can only be produced by
+            // the peripheral role, but the CYW43 reports it with Role = MASTER. The
+            // role test alone therefore routed it to the central path:
+            // ble_periph_on_conn_failed() — written for exactly this status — was
+            // never called, the peripheral kept believing it was advertising for the
+            // whole software timeout, and the upstream state machine swallowed a
+            // phantom "connect failed". Route this status by what it MEANS, not by a
+            // Role field the controller fills in arbitrarily on a failure.
+            bool periph_failure = (status != ERROR_CODE_SUCCESS) &&
+                                  ((role == HCI_ROLE_SLAVE) ||
+                                   (status == ERROR_CODE_DIRECTED_ADVERTISING_TIMEOUT));
+            if (status != ERROR_CODE_SUCCESS) {
+                C1_DBG_STATUS("[LE-CONN] fallita: status=0x%02x role=%u -> %s\n",
+                              status, role, periph_failure ? "peripheral" : "central");
+            }
+            if (periph_failure) {
                 ble_periph_on_conn_failed(status);
             } else if (role == HCI_ROLE_SLAVE) {
                 ble_periph_on_connected(handle, pkt);
@@ -361,8 +484,37 @@ static void hci_event_handler(uint8_t ptype, uint16_t ch, uint8_t *pkt, uint16_t
         }
         break;
 
+    case HCI_EVENT_NUMBER_OF_COMPLETED_PACKETS:
+        // Controller credits, all ACL traffic (HID plus GATT control).
+        if(sz>=3) for(unsigned i=0;i<pkt[2] && 3u+4u*i+4u<=sz;i++) {
+            unsigned off=3u+4u*i;
+            ble_relay_trace_completed(little_endian_read_16(pkt,off),little_endian_read_16(pkt,off+2));
+        }
+        break;
+
+    case HCI_EVENT_LE_META:
+        if (hci_event_le_meta_get_subevent_code(pkt)==HCI_SUBEVENT_LE_CONNECTION_UPDATE_COMPLETE) {
+            uint8_t status=hci_subevent_le_connection_update_complete_get_status(pkt);
+            uint32_t trace[7]={4,btstack_run_loop_get_time_ms(),
+                hci_subevent_le_connection_update_complete_get_connection_handle(pkt),
+                status ? 0 : hci_subevent_le_connection_update_complete_get_conn_interval(pkt),
+                status ? 0 : hci_subevent_le_connection_update_complete_get_conn_latency(pkt),
+                status ? 0 : hci_subevent_le_connection_update_complete_get_supervision_timeout(pkt),status};
+            trace_link_event(trace,-1);
+        } else if (hci_event_le_meta_get_subevent_code(pkt)==HCI_SUBEVENT_LE_REMOTE_CONNECTION_PARAMETER_REQUEST) {
+            trace_param_request(hci_subevent_le_remote_connection_parameter_request_get_connection_handle(pkt),
+                                hci_subevent_le_remote_connection_parameter_request_get_interval_min(pkt),
+                                hci_subevent_le_remote_connection_parameter_request_get_interval_max(pkt),
+                                hci_subevent_le_remote_connection_parameter_request_get_latency(pkt),
+                                hci_subevent_le_remote_connection_parameter_request_get_timeout(pkt),1);
+        }
+        break;
+
     case HCI_EVENT_DISCONNECTION_COMPLETE: {
         hci_con_handle_t handle = hci_event_disconnection_complete_get_connection_handle(pkt);
+        uint32_t trace[7]={5,btstack_run_loop_get_time_ms(),handle,
+            hci_event_disconnection_complete_get_reason(pkt),0,0,0};
+        trace_link_event(trace,-1);
 
         if (handle == g_ble_periph_handle) {
             ble_periph_on_disconnected(handle);
@@ -389,6 +541,7 @@ static void sm_event_handler(uint8_t ptype, uint16_t ch, uint8_t *pkt, uint16_t 
     UNUSED(ch); UNUSED(sz);
     if (ptype != HCI_EVENT_PACKET) return;
 
+    if (ble_central_pairing_identity_event(pkt)) return;
     switch (hci_event_packet_get_type(pkt)) {
     case SM_EVENT_JUST_WORKS_REQUEST:
         sm_just_works_confirm(sm_event_just_works_request_get_handle(pkt));
@@ -406,7 +559,7 @@ static void sm_event_handler(uint8_t ptype, uint16_t ch, uint8_t *pkt, uint16_t 
                 C1_DBG_STATUS("[SM] Central pairing complete — starting HID discovery\n");
                 ble_central_start_hid_discovery();
             } else {
-                C1_DBG_STATUS("[SM] Central pairing failed (0x%02x) — disconnecting\n", status);
+                C1_DBG_STATUS("[SM] Central pairing failed status=0x%02x reason=0x%02x db=%d — disconnecting\n", status, sm_event_pairing_complete_get_reason(pkt), sm_le_device_index(handle));
                 gap_disconnect(g_ble_central_handle);
             }
         } else if (handle == g_ble_periph_handle) {
@@ -414,7 +567,7 @@ static void sm_event_handler(uint8_t ptype, uint16_t ch, uint8_t *pkt, uint16_t 
             if (status == ERROR_CODE_SUCCESS) {
                 C1_DBG_STATUS("[SM] Peripheral pairing complete (bonded with downstream)\n");
             } else {
-                C1_DBG_STATUS("[SM] Peripheral pairing failed (0x%02x)\n", status);
+                C1_DBG_STATUS("[SM] Peripheral pairing failed status=0x%02x reason=0x%02x\n", status, sm_event_pairing_complete_get_reason(pkt));
             }
         }
         break;
@@ -424,35 +577,21 @@ static void sm_event_handler(uint8_t ptype, uint16_t ch, uint8_t *pkt, uint16_t 
         // Must start HID discovery here, same as SM_EVENT_PAIRING_COMPLETE.
         hci_con_handle_t handle = sm_event_reencryption_complete_get_handle(pkt);
         uint8_t          status = sm_event_reencryption_complete_get_status(pkt);
-        // Identity address of the bonded peer — authoritative key to purge a stale bond.
-        bd_addr_t id_addr;
-        sm_event_reencryption_complete_get_address(pkt, id_addr);
-        uint8_t id_addr_type = sm_event_reencryption_complete_get_addr_type(pkt);
         if (handle == g_ble_central_handle) {
             if (status == ERROR_CODE_SUCCESS) {
                 C1_DBG_STATUS("[SM] Central re-encryption complete — starting HID discovery\n");
                 ble_central_start_hid_discovery();
             } else {
-                // Re-encryption with a stale LTK failed (peer was re-paired/reset on its
-                // side). Purge the stale bond so the next attempt does a fresh pairing.
-                C1_DBG_STATUS("[SM] Central re-encryption failed (0x%02x) — clearing stale bond\n", status);
-                gap_delete_bonding((bd_addr_type_t)id_addr_type, id_addr);
-                if (status == ERROR_CODE_PIN_OR_KEY_MISSING) {
-                    // Link still up — re-pair fresh on the same connection.
-                    sm_request_pairing(g_ble_central_handle);
-                } else {
-                    // Remote already terminated the link (e.g. 0x13) — drop it; the next
-                    // reconnect/scan will fresh-pair now that no stored key remains.
-                    gap_disconnect(g_ble_central_handle);
-                }
+                // Transport failure is not evidence of a stale key. Only an
+                // explicit user pairing/reset operation may remove a bond.
+                C1_DBG_STATUS("[SM] Central re-encryption failed (0x%02x), bond preserved\n", status);
+                gap_disconnect(g_ble_central_handle);
             }
         } else if (handle == g_ble_periph_handle) {
             if (status == ERROR_CODE_SUCCESS) {
                 C1_DBG_STATUS("[SM] Peripheral re-encryption complete\n");
             } else {
-                // Downstream host lost its bond — purge ours so it can re-pair cleanly.
-                C1_DBG_STATUS("[SM] Peripheral re-encryption failed (0x%02x) — clearing stale bond\n", status);
-                gap_delete_bonding((bd_addr_type_t)id_addr_type, id_addr);
+                C1_DBG_STATUS("[SM] Peripheral re-encryption failed (0x%02x), bond preserved\n", status);
             }
         }
         break;
@@ -519,11 +658,15 @@ void ble_manager_handle_ipc(uint32_t msg) {
         break;
 
     case IPC_SEND_MOUSE_REPORT:
-        mouse_slot_take();
+        mouse_slot_take(true);
         break;
 
     case IPC_SEND_PB_REPORT:
-        pb_slot_take();
+        pb_slot_take(true);
+        break;
+
+    case IPC_SEND_CONSUMER_REPORT:
+        consumer_slot_take(true);
         break;
 
     case IPC_STOP_ADV:
@@ -541,20 +684,14 @@ void ble_manager_handle_ipc(uint32_t msg) {
         break;
 
     case IPC_BLE_POWER_OFF:
-        // Low-power DEEP-sleep prepare: stop the radio (discards all BLE links),
-        // then break out of the run loop so core1_entry can power the CYW43 module
-        // down. There is NO in-place resume — Core 0 reboots the whole chip on the
-        // wake keypress (HCI_POWER_OFF/ON is unreliable on the CYW43 transport;
-        // a clean boot reconnects from the bonding store).
-        C1_DBG_STATUS("[BLE] deep-sleep power down\n");
-        hci_power_control(HCI_POWER_OFF);
-        btstack_run_loop_trigger_exit();
+        // FIFO is a request, never an unconditional power-off instruction.
+        ble_power_request_off((uint16_t)payload);
         break;
 
     case IPC_SET_BATTERY_LEVEL: {
-        uint8_t soc = (uint8_t)payload;
-        if (soc > 100) soc = 100;
-        battery_service_server_set_battery_value(soc);
+        // Bug #3: ble_batt owns BAS #1 (min local/peer) and serves the
+        // local SoC to the sibling over peer_batt.
+        ble_batt_set_local((uint8_t)payload);
         break;
     }
 
@@ -565,8 +702,15 @@ void ble_manager_handle_ipc(uint32_t msg) {
         bd_addr_t addr;
         uint8_t   addr_type;
         while (ipc_get_delete_bonding_addr(addr, &addr_type)) {
+            unsigned matches=0;
+            for(int i=0;i<le_device_db_max_count();i++) {
+                int type; bd_addr_t identity;
+                le_device_db_info(i,&type,identity,NULL);
+                if(type==addr_type && !memcmp(identity,addr,6)) ++matches;
+            }
             gap_delete_bonding((bd_addr_type_t)addr_type, addr);
-            C1_DBG_STATUS("[SM] Deleted stale bond for %s\n", bd_addr_to_str(addr));
+            C1_DBG_STATUS("[SM] Explicit delete address=%s type=%u matches=%u\n",
+                          bd_addr_to_str(addr),addr_type,matches);
         }
         break;
     }

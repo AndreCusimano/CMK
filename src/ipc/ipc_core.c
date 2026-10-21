@@ -206,10 +206,6 @@ bool ipc_get_mouse_report(uint8_t report_out[7]) {
     if (valid) {
         for (int i = 0; i < 7; i++) report_out[i] = (uint8_t)s_mouse_report[i];
         s_mouse_report_valid = false;
-    } else {
-        // Stale notify (slot already consumed by a previous coalesced read).
-        // Do NOT fabricate an all-zero report — that would release held buttons.
-        for (int i = 0; i < 7; i++) report_out[i] = 0;
     }
     spin_unlock(s_lock, save);
     return valid;
@@ -239,8 +235,37 @@ bool ipc_get_pb_report(uint8_t report_out[4]) {
     if (valid) {
         for (int i = 0; i < 4; i++) report_out[i] = (uint8_t)s_pb_report[i];
         s_pb_report_valid = false;
-    } else {
-        for (int i = 0; i < 4; i++) report_out[i] = 0;
+    }
+    spin_unlock(s_lock, save);
+    return valid;
+}
+
+// ---------------------------------------------------------------------------
+// Consumer report slot (bug #6) — Core 0 writes, Core 1 reads (single-slot, last-wins)
+// ---------------------------------------------------------------------------
+
+static volatile uint8_t s_consumer_report[2];
+static volatile bool    s_consumer_report_valid = false;
+
+bool ipc_put_consumer_report(const uint8_t report[2]) {
+    uint32_t save = spin_lock_blocking(s_lock);
+    bool was_valid = s_consumer_report_valid;
+    s_consumer_report[0] = report[0];
+    s_consumer_report[1] = report[1];
+    s_consumer_report_valid = true;
+    spin_unlock(s_lock, save);
+    // Coalescing notify (R3) — see mouse above.
+    if (!was_valid) return ipc_push_to_core1(IPC_ENCODE(IPC_SEND_CONSUMER_REPORT, 0));
+    return true;
+}
+
+bool ipc_get_consumer_report(uint8_t report_out[2]) {
+    uint32_t save = spin_lock_blocking(s_lock);
+    bool valid = s_consumer_report_valid;
+    if (valid) {
+        report_out[0] = (uint8_t)s_consumer_report[0];
+        report_out[1] = (uint8_t)s_consumer_report[1];
+        s_consumer_report_valid = false;
     }
     spin_unlock(s_lock, save);
     return valid;
@@ -523,6 +548,8 @@ void ipc_publish_ble_status(const ipc_ble_status_t *st) {
     s_ble_status.central     = st->central;
     s_ble_status.active_slot = st->active_slot;
     s_ble_status.split_role  = st->split_role;
+    s_ble_status.peer_batt   = st->peer_batt;
+    s_ble_status.mouse_batt  = st->mouse_batt;
     s_ble_status.valid       = true;
     spin_unlock(s_lock, save);
 }
@@ -533,6 +560,8 @@ void ipc_get_ble_status(ipc_ble_status_t *out) {
     out->central     = s_ble_status.central;
     out->active_slot = s_ble_status.active_slot;
     out->split_role  = s_ble_status.split_role;
+    out->peer_batt   = s_ble_status.peer_batt;
+    out->mouse_batt  = s_ble_status.mouse_batt;
     out->valid       = s_ble_status.valid;
     spin_unlock(s_lock, save);
 }
@@ -697,3 +726,72 @@ bool ipc_split_take_remote_snapshot(uint32_t *bitmap_out) {
     s_split_rx_snapshot_pending = false;
     return true;
 }
+
+// Power state shares the existing report/status lock. Never hold it across BLE,
+// stdio or FreeRTOS calls. Cancellation and commit have one linearization point.
+static power_state_t s_power;
+void ipc_power_init(uint64_t now) {
+    uint32_t irq=spin_lock_blocking(s_lock);
+    memset(&s_power,0,sizeof(s_power)); s_power.boot_us=now;
+    spin_unlock(s_lock,irq);
+}
+void ipc_power_local(const power_local_t *local) {
+    uint32_t irq=spin_lock_blocking(s_lock); s_power.local=*local;
+    spin_unlock(s_lock,irq);
+}
+void ipc_power_radio(const power_radio_t *radio) {
+    uint32_t irq=spin_lock_blocking(s_lock); s_power.radio=*radio;
+    spin_unlock(s_lock,irq);
+}
+void ipc_power_get(power_state_t *out) {
+    uint32_t irq=spin_lock_blocking(s_lock); *out=s_power;
+    spin_unlock(s_lock,irq);
+}
+uint16_t ipc_power_request(uint64_t now, uint32_t deep_ms) {
+    uint32_t irq=spin_lock_blocking(s_lock);
+    uint16_t token=power_request(&s_power,now,deep_ms);
+    spin_unlock(s_lock,irq); return token;
+}
+void ipc_power_cancel(void) {
+    uint32_t irq=spin_lock_blocking(s_lock); power_cancel(&s_power);
+    spin_unlock(s_lock,irq);
+}
+bool ipc_power_commit(uint16_t token, uint64_t now, uint32_t deep_ms) {
+    uint32_t irq=spin_lock_blocking(s_lock);
+    bool ok=power_commit(&s_power,token,now,deep_ms);
+    spin_unlock(s_lock,irq); return ok;
+}
+void ipc_power_off(void) {
+    uint32_t irq=spin_lock_blocking(s_lock);
+    if (s_power.phase==POWER_COMMITTED) s_power.phase=POWER_OFF;
+    spin_unlock(s_lock,irq);
+}
+
+void ipc_power_usb(bool active) {
+    uint32_t irq=spin_lock_blocking(s_lock); s_power.local.usb=active;
+    if (active) power_cancel(&s_power);
+    spin_unlock(s_lock,irq);
+}
+
+#if DEBUG_MOUSE_TRACE
+static uint32_t s_trace[IPC_TRACE_CAPACITY][7];
+static uint32_t s_trace_end;
+void ipc_trace_put(const uint32_t words[7]) {
+    uint32_t irq=spin_lock_blocking(s_lock);
+    memcpy(s_trace[s_trace_end % IPC_TRACE_CAPACITY],words,7*sizeof(uint32_t));
+    ++s_trace_end;
+    spin_unlock(s_lock,irq);
+}
+uint32_t ipc_trace_end(void) {
+    uint32_t irq=spin_lock_blocking(s_lock);
+    uint32_t end=s_trace_end;
+    spin_unlock(s_lock,irq); return end;
+}
+bool ipc_trace_get(uint32_t sequence,uint32_t words[7]) {
+    uint32_t irq=spin_lock_blocking(s_lock);
+    uint32_t age=s_trace_end-sequence;
+    bool valid=age && age<=IPC_TRACE_CAPACITY && sequence<s_trace_end;
+    if(valid) memcpy(words,s_trace[sequence % IPC_TRACE_CAPACITY],7*sizeof(uint32_t));
+    spin_unlock(s_lock,irq); return valid;
+}
+#endif // DEBUG_MOUSE_TRACE
