@@ -40,7 +40,7 @@
 #define CMK_VERSION_H
 
 #define CMK_FW_VERSION_MAJOR  1
-#define CMK_FW_VERSION_MINOR  0
+#define CMK_FW_VERSION_MINOR  1
 #define CMK_FW_VERSION_PATCH  0
 
 // Human-readable string for the boot banner, derived from the integers above so

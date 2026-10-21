@@ -89,6 +89,7 @@ set(CMK_SOURCES
         src/core0/core/action_layer.c
         src/core0/core/keymap.c
         src/core0/core/dynamic_keymap.c
+        src/core0/core/macro_storage.c
         src/core0/core/action_util.c
         src/core0/core/action_tapping.c
         src/core0/core/process_record.c
@@ -107,6 +108,7 @@ set(CMK_SOURCES
         src/core0/process_keycode/process_auto_shift.c
         src/core0/process_keycode/process_leader.c
         src/core0/process_keycode/process_dynamic_macro.c
+        src/core0/process_keycode/process_macro.c
         src/core0/process_keycode/process_space_cadet.c
         src/core0/process_keycode/process_grave_esc.c
         src/core0/process_keycode/process_magic.c
@@ -118,6 +120,7 @@ set(CMK_SOURCES
         src/core0/process_keycode/process_unicodemap.c
         src/core0/process_keycode/process_ucis.c
         src/core0/process_keycode/process_programmable_button.c
+        src/core0/process_keycode/process_consumer.c
         src/core0/process_keycode/process_rgb.c
         src/core0/process_keycode/process_backlight.c
 
@@ -144,6 +147,9 @@ set(CMK_SOURCES
 
         src/usb/usb_descriptors.c
         src/usb/usb_hid.c
+        src/usb/usb_debug.c
+        src/power/power_policy.c
+        src/ble/ble_power.c
         src/usb/os_detection.c
         src/usb/raw_hid.c
         src/usb/cmk_config_protocol.c
@@ -153,7 +159,9 @@ set(CMK_SOURCES
         src/ble/ble_periph.c
         src/ble/ble_central.c
         src/ble/ble_split.c
+        src/ble/ble_batt.c
         src/ble/ble_relay.c
+        src/ble/ble_link_policy.c
 )
 
 set(CMK_INCLUDE_DIRS
@@ -184,9 +192,10 @@ set(CMK_INCLUDE_DIRS
 
 set(CMK_LIBS
         pico_stdlib
+        pico_unique_id
         pico_multicore                      # multicore_launch_core1()
         pico_cyw43_arch_none                # CYW43: none-variant — Core 1 manages CYW43 directly
-        pico_btstack_ble                    # BLE + GATT services (hids_device, hids_client)
+        pico_btstack_ble                    # BLE + GATT services (hids_device, hids_host)
         pico_btstack_cyw43                  # CYW43 HCI transport + async_context integration
         FreeRTOS-Kernel-Heap4               # FreeRTOS (Core 0 only)
         hardware_gpio

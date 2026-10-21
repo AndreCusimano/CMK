@@ -44,6 +44,7 @@
 #include "action_layer.h"
 #include "action_util.h"
 #include "process_record.h"
+#include "eeconfig.h"      // eeconfig_read_tapping_term (bug #8)
 #include "config/cmk_config.h"
 #include "config/debug_config.h"
 
@@ -155,12 +156,16 @@ static void resolve_as_tap(void) {
         basic_kc = LT_KC(kc);
     }
 
-    // Emit the tap via the non-blocking queue: press and release land on separate
-    // keyscan ticks so the report is actually sent (a same-tick press+release nets
-    // to nothing) and a discrete down→up reaches both USB and the last-wins BLE slot.
+    // Commit both report snapshots BEFORE replaying later physical events.
+    // The USB report queue and BLE keyboard ring retain the down/up separately;
+    // no sleep or delayed tap_code is needed here. A delayed tap followed by a
+    // synchronous replay reverses a roll (MT(A), B becomes BA).
     if (basic_kc) {
-        tap_code(basic_kc);
-        DBG_KEY("[TAP] tap → kc=0x%02x queued\n", basic_kc);
+        register_code(basic_kc);
+        send_keyboard_report();
+        unregister_code(basic_kc);
+        send_keyboard_report();
+        DBG_KEY("[TAP] tap → kc=0x%02x before replay\n", basic_kc);
     }
 
     // Replay buffered events (no layer/mod context — tap resolved, no relookup)
@@ -211,6 +216,20 @@ bool action_tapping_process(const keyevent_t *event) {
 }
 
 // ---------------------------------------------------------------------------
+// Tapping term (bug #8) — eeconfig value, 0 = factory default (TAPPING_TERM).
+// Clamped at read: single point of truth, so an out-of-range EEPROM value
+// can never produce a 0 ms or a minutes-long hold threshold.
+// ---------------------------------------------------------------------------
+
+uint16_t tapping_term_get(void) {
+    uint16_t ms = eeconfig_read_tapping_term();
+    if (ms == 0) return TAPPING_TERM;
+    if (ms < TAPPING_TERM_MIN) return TAPPING_TERM_MIN;
+    if (ms > TAPPING_TERM_MAX) return TAPPING_TERM_MAX;
+    return ms;
+}
+
+// ---------------------------------------------------------------------------
 // Tick — timeout check
 // ---------------------------------------------------------------------------
 
@@ -218,7 +237,7 @@ void action_tapping_tick(uint32_t now_ticks) {
     if (s_state != TAP_PRESSED) return;
 
     TickType_t elapsed = (TickType_t)(now_ticks - s_tapping_key.timestamp);
-    if (elapsed >= pdMS_TO_TICKS(TAPPING_TERM)) {
+    if (elapsed >= pdMS_TO_TICKS(tapping_term_get())) {   // bug #8: runtime term
         // Timeout → HOLD
         DBG_KEY("[TAP] timeout → HOLD\n");
         resolve_as_hold();

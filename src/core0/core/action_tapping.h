@@ -49,7 +49,12 @@ void action_tapping_init(void);
 // Returns false if it should be handled as a normal key immediately.
 bool action_tapping_process(const keyevent_t *event);
 
-// Tick — check TAPPING_TERM timeout. Call every scan cycle.
+// Tick — check the tapping term timeout. Call every scan cycle.
 void action_tapping_tick(uint32_t now_ticks);
+
+// Effective tapping term in ms (bug #8): eeconfig `tapping_term`, where 0 =
+// factory default (TAPPING_TERM); clamped to TAPPING_TERM_MIN..MAX. Shared
+// by MT/LT (here) and tap dance.
+uint16_t tapping_term_get(void);
 
 #endif // CMK_ACTION_TAPPING_H

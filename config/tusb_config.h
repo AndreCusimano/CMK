@@ -30,6 +30,7 @@
 #define TUSB_CONFIG_H
 
 #include "cmk_config.h"
+#include "debug_config.h"
 
 #ifdef USB_ENABLE
 
@@ -56,7 +57,12 @@
 #else
 #define CFG_TUD_HID             1       // Interface 0: kbd/mouse/PB only
 #endif
-#define CFG_TUD_CDC             0
+#define CFG_TUD_CDC             DEBUG_USB_SERIAL
+#if DEBUG_USB_SERIAL
+#define CFG_TUD_CDC_RX_BUFSIZE  64
+#define CFG_TUD_CDC_TX_BUFSIZE  256
+#define CFG_TUD_CDC_EP_BUFSIZE  64
+#endif
 #define CFG_TUD_MSC             0
 #define CFG_TUD_MIDI            0
 #define CFG_TUD_VENDOR          0

@@ -49,4 +49,8 @@ void send_string_tick(uint32_t now_ticks);
 // Returns true if a string send is in progress.
 bool send_string_is_active(void);
 
+// ASCII → LUT entry for external interpreters (process_macro, Phase 15e):
+// bits 7:0 = HID keycode, bit 15 = needs Shift, 0 = unsupported / c >= 128.
+uint16_t send_string_ascii_entry(char c);
+
 #endif // CMK_SEND_STRING_H

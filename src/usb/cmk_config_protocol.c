@@ -20,10 +20,12 @@
  */
 
 //
-// cmk_config_protocol.c — see cmk_config_protocol.h and CMK_Config_Protocol.md.
+// cmk_config_protocol.c — see cmk_config_protocol.h and CMK_Protocol.md.
 //
 
 #include "config/cmk_config.h"
+#include "low_power.h"
+#include "pico/time.h"
 
 #ifdef RAW_HID_ENABLE
 
@@ -31,11 +33,18 @@
 #include "raw_hid.h"
 #include "board_side.h"
 #include "eeconfig.h"
+#include "low_power.h"     // low_power_refresh_config() — LP timeouts via SET_SETTING
+#include "action_tapping.h" // tapping_term_get() — GET_SETTINGS d[11..12] (bug #8)
 #include "process_secure.h"
 #include "inter_half_sync.h"
 #include "diag.h"
 #include "i2c1_link.h"
 #include "connection_manager.h"
+#include "power_manager.h"   // pm_get_battery_status()/pm_is_charging() — GET_BATTERY
+#ifdef MACRO_STORAGE_ENABLE
+#include "macro_storage.h"   // Phase 15e: macro buffer commands 0x41/0x43/0x44/0x4F
+#include "process_macro.h"   // macro_play_request_abort() before buffer mutations
+#endif
 #include "ipc/ipc_core.h"
 #ifdef USB_ENABLE
 #include "usb/usb_hid.h"
@@ -88,7 +97,9 @@ static uint8_t feature_flags(void) {
 #ifdef DYNAMIC_KEYMAP_ENABLE
     f |= 0x08;
 #endif
-    // bit4 DYNAMIC_MACRO — not implemented yet
+#ifdef MACRO_STORAGE_ENABLE
+    f |= 0x10;   // bit4: macro storage (Phase 15e — v5; was the never-set DYNAMIC_MACRO)
+#endif
 #ifdef BACKLIGHT_ENABLE
     f |= 0x20;
 #endif
@@ -157,6 +168,8 @@ static bool cmd_is_write(uint8_t cmd) {
         case CMD_SET_RGB_CONFIG:
         case CMD_SET_RGB_FIELD:
         case CMD_SET_SETTING:
+        case CMD_SET_MACRO_BUFFER:
+        case CMD_RESET_MACROS:
         case CMD_EEPROM_RESET:
             return true;
         default:
@@ -193,6 +206,9 @@ static bool cmd_is_read(uint8_t cmd) {
         case CMD_GET_KEYMAP_BUFFER:
         case CMD_GET_RGB_CONFIG:
         case CMD_GET_SETTINGS:
+        case CMD_GET_BATTERY:      // per-side: each half answers with ITS fuel gauge
+        case CMD_GET_MACRO_INFO:   // per-side (macros stored per-half like the keymap)
+        case CMD_GET_MACRO_BUFFER:
             return true;
         default:
             return false;
@@ -249,6 +265,36 @@ static void cfg_dispatch(const uint8_t *req, uint8_t *resp) {
         // R1 telemetry. req[2] = page (7 counters per page, uint32 BE each).
         // Response: d[0]=page, d[1]=count on this page, d[2..] = count×4 bytes.
         uint8_t page = req[2];
+        if (page == 0xFD || page == 0xFC) {
+            uint32_t words[7]={1,IPC_TRACE_CAPACITY,ipc_trace_end(),0,0,0,0};
+            if (page==0xFC) {
+                uint32_t seq=((uint32_t)req[3]<<24)|((uint32_t)req[4]<<16)|
+                             ((uint32_t)req[5]<<8)|req[6];
+                if (!ipc_trace_get(seq,words)) { resp[1]=ST_OUT_OF_RANGE; break; }
+            }
+            d[0]=page; d[1]=7;
+            for(unsigned i=0;i<7;i++) for(unsigned b=0;b<4;b++)
+                d[2+4*i+b]=(uint8_t)(words[i]>>(24-8*b));
+            break;
+        }
+        if (page == 0xFE) {
+            // Additive diagnostic page: no persistent format/version changes.
+            power_state_t p; ipc_power_get(&p);
+            uint64_t now=time_us_64();
+            d[0]=0xFE; d[1]=26; d[2]=(uint8_t)low_power_state(); d[3]=p.phase;
+            d[4]=power_veto(&p,now,LP_DEEP_IDLE_MS);
+            if (p.phase==POWER_REQUESTED && p.radio.peer_connected && p.radio.peer_ack!=p.token) d[4]|=POWER_VETO_PEER;
+            d[5]=(p.local.held?1:0)|(p.local.usb?2:0)|(p.radio.peer_connected?4:0)|
+                 (p.radio.peer_ready?8:0)|(p.radio.peer_held?16:0)|(p.radio.held?32:0)|
+                 (p.radio.pending?64:0)|(p.local.ready?128:0);
+            d[6]=(uint8_t)(p.token>>8); d[7]=(uint8_t)p.token;
+            uint32_t age[5]={power_age_ms(now,power_last_key(&p)),
+                power_age_ms(now,p.radio.hid_us),power_age_ms(now,p.radio.peer_key_us),
+                power_age_ms(now,p.radio.peer_hid_us),power_age_ms(now,p.radio.peer_sample_us)};
+            for (unsigned i=0;i<5;++i) for (unsigned b=0;b<4;++b)
+                d[8+4*i+b]=(uint8_t)(age[i]>>(24-8*b));
+            break;
+        }
         if (page == 0xFF) {
             // Live-state snapshot (debug): not counters — raw machine state.
             // d[2]=ih state, d[3]=loop-exit liveness, d[4]=slave-persistent,
@@ -305,6 +351,22 @@ static void cfg_dispatch(const uint8_t *req, uint8_t *resp) {
         break;
     }
 
+    case CMD_GET_BATTERY: {
+        // v5 (bug #3). Per-side read: each half answers with its OWN fuel gauge
+        // (a peer-targeted request rides the I2C1 proxy). d[3]/d[4] are the
+        // BLE view of the half that holds the link (0xFF elsewhere/unknown).
+        pm_battery_status_t bat;
+        pm_get_battery_status(&bat);
+        uint8_t peer_batt, mouse_batt;
+        connection_manager_get_ble_batt(&peer_batt, &mouse_batt);
+        d[0] = bat.valid ? 1 : 0;
+        d[1] = bat.soc_pct;
+        d[2] = pm_is_charging() ? 1 : 0;
+        d[3] = peer_batt;    // sibling half via CMK-Split peer_batt
+        d[4] = mouse_batt;   // upstream mouse via BAS client
+        break;
+    }
+
     case CMD_GET_KEYBOARD_INFO: {
         // Phase 18: every half stores the COMPLETE unified 4×12 keymap, so the
         // addressable board is always 12 logical cols at offset 0 (0–5 left,
@@ -331,6 +393,10 @@ static void cfg_dispatch(const uint8_t *req, uint8_t *resp) {
         eeconfig_factory_reset();
 #ifdef DYNAMIC_KEYMAP_ENABLE
         dynamic_keymap_reset(board_side_get());
+#endif
+#ifdef MACRO_STORAGE_ENABLE
+        macro_play_request_abort();
+        macro_storage_reset();   // v5: factory reset also clears the macro region
 #endif
         break;
 
@@ -406,6 +472,63 @@ static void cfg_dispatch(const uint8_t *req, uint8_t *resp) {
         if (!dynamic_keymap_set_buffer(off, size, &req[5])) {
             resp[1] = ST_OUT_OF_RANGE;
         }
+#else
+        resp[1] = ST_NOT_SUPPORTED;
+#endif
+        break;
+    }
+
+    case CMD_GET_MACRO_INFO: {
+#ifdef MACRO_STORAGE_ENABLE
+        uint16_t msz = macro_storage_size();
+        d[0] = macro_storage_count();
+        d[1] = (uint8_t)(msz >> 8);      // big-endian, like the keymap buffers
+        d[2] = (uint8_t)(msz & 0xFF);
+        d[3] = MACRO_STORAGE_VERSION;
+#else
+        resp[1] = ST_NOT_SUPPORTED;
+#endif
+        break;
+    }
+
+    case CMD_GET_MACRO_BUFFER: {
+#ifdef MACRO_STORAGE_ENABLE
+        uint16_t off  = ((uint16_t)req[2] << 8) | req[3];   // big-endian @req[2..3]
+        uint8_t  size = req[4];
+        if (size > CFG_BUF_MAX_GET) { resp[1] = ST_BAD_PARAMS; break; }
+        d[0] = (uint8_t)(off >> 8);
+        d[1] = (uint8_t)(off & 0xFF);
+        d[2] = size;
+        if (!macro_storage_get_buffer(off, size, &d[3])) {
+            resp[1] = ST_OUT_OF_RANGE;
+        }
+#else
+        resp[1] = ST_NOT_SUPPORTED;
+#endif
+        break;
+    }
+
+    case CMD_SET_MACRO_BUFFER: {
+#ifdef MACRO_STORAGE_ENABLE
+        uint16_t off  = ((uint16_t)req[2] << 8) | req[3];   // big-endian @req[2..3]
+        uint8_t  size = req[4];                             // data @req[5..]
+        if (size > CFG_BUF_MAX_SET) { resp[1] = ST_BAD_PARAMS; break; }
+        // Stop an active playback BEFORE mutating the buffer — the FSM walks
+        // the RAM cache from the keyscan task (flag, served by keyscan).
+        macro_play_request_abort();
+        if (!macro_storage_set_buffer(off, size, &req[5])) {
+            resp[1] = ST_OUT_OF_RANGE;
+        }
+#else
+        resp[1] = ST_NOT_SUPPORTED;
+#endif
+        break;
+    }
+
+    case CMD_RESET_MACROS: {
+#ifdef MACRO_STORAGE_ENABLE
+        macro_play_request_abort();
+        macro_storage_reset();
 #else
         resp[1] = ST_NOT_SUPPORTED;
 #endif
@@ -493,6 +616,19 @@ static void cfg_dispatch(const uint8_t *req, uint8_t *resp) {
         d[4] = eeconfig_read_unicode_mode();
         d[5] = eeconfig_read_output_target();
         d[6] = eeconfig_read_split_mode();
+        // v5 (bug #2): LP timeouts in seconds, LE16 — same byte order as the
+        // SET_SETTING value, so the UI reads back exactly what it wrote.
+        uint16_t lp_light = eeconfig_read_lp_light_s();
+        uint16_t lp_deep  = eeconfig_read_lp_deep_s();
+        d[7]  = (uint8_t)(lp_light & 0xFF);
+        d[8]  = (uint8_t)(lp_light >> 8);
+        d[9]  = (uint8_t)(lp_deep & 0xFF);
+        d[10] = (uint8_t)(lp_deep >> 8);
+        // v5 (bug #8): EFFECTIVE tapping term ms, LE16 (never 0 — the getter
+        // resolves 0 → factory default and clamps)
+        uint16_t tt = tapping_term_get();
+        d[11] = (uint8_t)(tt & 0xFF);
+        d[12] = (uint8_t)(tt >> 8);
         break;
     }
 
@@ -506,7 +642,22 @@ static void cfg_dispatch(const uint8_t *req, uint8_t *resp) {
             case 0x03: eeconfig_update_unicode_mode((uint8_t)value);  break;
             case 0x04: eeconfig_update_output_target((uint8_t)value); break;
             case 0x05: eeconfig_update_split_mode((uint8_t)value);    break;
-            default:   resp[1] = ST_BAD_PARAMS;                       break;
+            // v5 (bug #2): LP timeouts in seconds, 0 = tier disabled. Refresh so
+            // the change takes effect without a reboot.
+            case 0x06: eeconfig_update_lp_light_s(value);
+                       low_power_refresh_config();                    break;
+            case 0x07: eeconfig_update_lp_deep_s(value);
+                       low_power_refresh_config();                    break;
+            // v5 (bug #8): tapping term ms (LE16). 0 = back to the factory
+            // default; silent firmware-side clamp (like the other ids).
+            // Immediate effect: the getter reads eeconfig live.
+            case 0x08:
+                if (value != 0) {
+                    if (value < TAPPING_TERM_MIN) value = TAPPING_TERM_MIN;
+                    if (value > TAPPING_TERM_MAX) value = TAPPING_TERM_MAX;
+                }
+                eeconfig_update_tapping_term(value);
+                break;
         }
         break;
     }

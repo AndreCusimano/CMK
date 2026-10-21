@@ -105,7 +105,7 @@ typedef enum {
     // observe the central's mode). Payload = peer side (0/1).
     IPC_SPLIT_ROLE_MISMATCH   = 0x27,  // C1→C0: sibling found, split_mode mismatch
 
-    // Low-power DEEP sleep prepare. Pushed by the CM task (deferred flag, R3)
+    // Low-power DEEP request (payload = nonzero request token). Pushed by the CM task (deferred flag, R3)
     // when low_power enters DEEP. Core 1 stops the radio + powers the CYW43 down
     // and halts. There is NO power-on counterpart: Core 0 reboots the chip on the
     // wake keypress (watchdog), so reconnect runs via the clean boot path.
@@ -116,6 +116,10 @@ typedef enum {
     IPC_SEND_RGB_SYNC         = 0x29,  // C0→C1: MASTER writes the RGB state frame to the slave
     IPC_RGB_SYNC_RX           = 0x2A,  // C1→C0: SLAVE received an RGB frame from the master
     IPC_SEND_RGB_HIT          = 0x2B,  // C0→C1: MASTER forwards a local key hit; payload = packed hit
+
+    // Consumer Control report (bug #6) — 2-byte 16-bit usage, Report ID 4.
+    // Single-slot last-wins buffer like mouse/PB; data in shared buffer.
+    IPC_SEND_CONSUMER_REPORT  = 0x2C,  // C0→C1: full 2-byte consumer report
 } ipc_msg_type_t;
 
 // ---------------------------------------------------------------------------
@@ -217,11 +221,24 @@ bool ipc_pop_hid_report(uint8_t *data_out, uint8_t *len_out);
 // master/slave). `valid` flips true at the first publish.
 // ---------------------------------------------------------------------------
 
+#include "power/power_policy.h"
+void ipc_power_init(uint64_t now);
+void ipc_power_local(const power_local_t *local);
+void ipc_power_usb(bool active);
+void ipc_power_radio(const power_radio_t *radio);
+void ipc_power_get(power_state_t *out);
+uint16_t ipc_power_request(uint64_t now, uint32_t deep_ms);
+void ipc_power_cancel(void);
+bool ipc_power_commit(uint16_t token, uint64_t now, uint32_t deep_ms);
+void ipc_power_off(void);
+
 typedef struct {
     uint8_t periph;        // periph_state_t
     uint8_t central;       // central_state_t
     uint8_t active_slot;   // DS slot whose identity is currently set
     uint8_t split_role;    // 0=standalone 1=master 2=slave
+    uint8_t peer_batt;     // sibling SoC via CMK-Split peer_batt (0xFF = unknown) — bug #3
+    uint8_t mouse_batt;    // upstream mouse SoC via BAS client (0xFF = unknown) — bug #3
     bool    valid;
 } ipc_ble_status_t;
 
@@ -252,6 +269,7 @@ bool ipc_put_mouse_report(const uint8_t report[7]);
 // Core 1: read the mouse report written by Core 0 (called on IPC_SEND_MOUSE_REPORT).
 // Returns false if the slot was already consumed (stale coalesced notify) — the
 // caller must NOT treat report_out as a valid state in that case.
+// On false, report_out is unchanged (it may hold a pending BLE report).
 bool ipc_get_mouse_report(uint8_t report_out[7]);
 
 // Core 0 → Core 1: write a 4-byte programmable button report and push IPC_SEND_PB_REPORT.
@@ -260,7 +278,16 @@ bool ipc_put_pb_report(const uint8_t report[4]);
 
 // Core 1: read the programmable button report (called on IPC_SEND_PB_REPORT).
 // Returns false if the slot was already consumed (stale coalesced notify).
+// On false, report_out is unchanged.
 bool ipc_get_pb_report(uint8_t report_out[4]);
+
+// Core 0 → Core 1: write a 2-byte consumer report (16-bit usage LE) and push
+// IPC_SEND_CONSUMER_REPORT. Single-slot, last-wins (bug #6).
+bool ipc_put_consumer_report(const uint8_t report[2]);
+
+// Core 1: read the consumer report (stale coalesced notify → returns false).
+// On false, report_out is unchanged.
+bool ipc_get_consumer_report(uint8_t report_out[2]);
 
 // Core 1 → Core 0: write an upstream BLE address and push IPC_SAVE_UPSTREAM_ADDR.
 // Single-slot, last-wins. Called after upstream HID service connects.
@@ -358,5 +385,23 @@ void core1_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
 // Core 0: drain all pending log messages to UART. Call from CM task loop.
 void ipc_log_drain(void);
+
+// Mouse flight recorder: fixed RAM ring, Core 1 producer, Core 0 reader.
+// Compiled out unless DEBUG_MOUSE_TRACE (config/debug_config.h): capacity 0,
+// put is a no-op and get never finds a record.
+#include "config/debug_config.h"
+#if DEBUG_MOUSE_TRACE
+#define IPC_TRACE_CAPACITY 4096u
+void ipc_trace_put(const uint32_t words[7]);
+uint32_t ipc_trace_end(void);
+bool ipc_trace_get(uint32_t sequence, uint32_t words[7]);
+#else
+#define IPC_TRACE_CAPACITY 0u
+static inline void ipc_trace_put(const uint32_t words[7]) { (void)words; }
+static inline uint32_t ipc_trace_end(void) { return 0; }
+static inline bool ipc_trace_get(uint32_t sequence, uint32_t words[7]) {
+    (void)sequence; (void)words; return false;
+}
+#endif
 
 #endif // CMK_IPC_CORE_H

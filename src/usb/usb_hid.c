@@ -31,10 +31,12 @@
 #ifdef USB_ENABLE
 
 #include "usb_hid.h"
+#include "usb_debug.h"
 #include "usb_descriptors.h"
 #include "tusb.h"
 #include "led_indicators.h"
 #include "diag.h"
+#include "ipc/ipc_core.h"
 
 #ifdef RAW_HID_ENABLE
 #include "raw_hid.h"
@@ -77,6 +79,7 @@ static void usb_device_task(void *param) {
     while (1) {
         DIAG_TASK_ALIVE(DIAG_TASK_USB);
         tud_task();
+        usb_debug_poll();
         // tud_task() does NOT block here: the pico-sdk compiles TinyUSB with
         // CFG_TUSB_OS=OPT_OS_PICO (family.cmake overrides our tusb_config.h),
         // so without this delay the loop busy-spins at priority 2 and STARVES
@@ -105,19 +108,23 @@ void usb_hid_task_create(void) {
 
 void tud_mount_cb(void) {
     s_usb_active = true;
+    ipc_power_usb(true);
 }
 
 void tud_umount_cb(void) {
     s_usb_active = false;
+    ipc_power_usb(false);
 }
 
 void tud_suspend_cb(bool remote_wakeup_en) {
     (void)remote_wakeup_en;
     s_usb_active = false;
+    ipc_power_usb(false);
 }
 
 void tud_resume_cb(void) {
     s_usb_active = true;
+    ipc_power_usb(true);
 }
 
 // ---------------------------------------------------------------------------
@@ -152,6 +159,16 @@ void usb_hid_send_pb_report(const uint8_t report[4]) {
         return;
     }
     if (!tud_hid_n_report(ITF_NUM_HID_KBD, HID_REPORT_ID_PROG_BUTTON, report, 4)) {
+        DIAG_INC(usb_pb_drop);
+    }
+}
+
+void usb_hid_send_consumer_report(const uint8_t report[2]) {
+    if (!s_usb_active || !tud_hid_n_ready(ITF_NUM_HID_KBD)) {
+        DIAG_INC(usb_pb_drop);   // shared drop counter (consumer events are rare)
+        return;
+    }
+    if (!tud_hid_n_report(ITF_NUM_HID_KBD, HID_REPORT_ID_CONSUMER, report, 2)) {
         DIAG_INC(usb_pb_drop);
     }
 }

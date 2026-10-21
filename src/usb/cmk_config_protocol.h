@@ -22,7 +22,7 @@
 //
 // cmk_config_protocol.h — CMK Config Protocol over Raw HID (Phase 15b).
 //
-// Implements the host↔device command set described in CMK_Config_Protocol.md
+// Implements the host↔device command set described in CMK_Protocol.md
 // (request/response, 32-byte reports). The handler overrides the weak
 // raw_hid_receive_cb() in raw_hid.c; it runs synchronously in the Core 0 USB
 // task and drives dynamic_keymap, eeconfig and the RGB engine.
@@ -35,12 +35,14 @@
 
 #include <stdint.h>
 
-// Command ids (CMK_Config_Protocol.md §11).
+// Command ids (CMK_Protocol.md §11).
 enum {
     CMD_GET_PROTOCOL_VERSION = 0x01,
     CMD_GET_KEYBOARD_INFO    = 0x02,
     CMD_GET_FW_VERSION       = 0x03,   // returns firmware semver: major, minor, patch
     CMD_GET_DIAG             = 0x04,   // R1 telemetry: drop/error counters (paged)
+    CMD_GET_BATTERY          = 0x05,   // v5 (bug #3): per-side battery — local valid/soc/
+                                       // charging + BLE-view peer/mouse (0xFF unknown)
     CMD_EEPROM_RESET         = 0x0D,
     CMD_COMMIT               = 0x0E,
     CMD_BOOTLOADER           = 0x0F,
@@ -55,6 +57,10 @@ enum {
     CMD_SET_RGB_FIELD        = 0x23,
     CMD_GET_SETTINGS         = 0x31,
     CMD_SET_SETTING          = 0x32,
+    CMD_GET_MACRO_INFO       = 0x41,   // v5 (Phase 15e): count + buffer size + version
+    CMD_GET_MACRO_BUFFER     = 0x43,   // v5: paged read of the macro byte buffer
+    CMD_SET_MACRO_BUFFER     = 0x44,   // v5: paged write (aborts an active playback)
+    CMD_RESET_MACROS         = 0x4F,   // v5: zero the macro region
 };
 
 // Status codes (response byte 1).

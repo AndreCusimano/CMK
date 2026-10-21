@@ -79,6 +79,11 @@ static volatile cm_ds_usb_state_t   s_ds_usb    = CM_DS_USB_IDLE;
 static volatile cm_split_role_t     s_split_role  = CM_SPLIT_STANDALONE;
 static volatile uint8_t             s_remote_side = 0;   // peer half board side (MASTER)
 
+// Bug #3: BLE-side battery view sampled from the Core 1 status slot (R3).
+// 0xFF = unknown. Read cross-task by the config protocol (GET_BATTERY).
+static volatile uint8_t s_ble_peer_batt  = 0xFF;
+static volatile uint8_t s_ble_mouse_batt = 0xFF;
+
 // Quale slot DS è in attesa di connessione (-1 = nessuno).
 // volatile: scritto dal keyscan task (API pubbliche), letto dal CM task.
 static volatile int8_t s_pending_ds_slot = -1;
@@ -110,10 +115,7 @@ static volatile bool    s_deferred_disconnect_ds = false;  // disconnect current
 static volatile bool    s_deferred_clear_all     = false;  // factory reset: clear all bonds + SM keys
 static bool             s_delbond_notify_pending = false;  // IPC_DELETE_BONDING notify to retry
 
-// Low-power DEEP-sleep prepare (set by connection_manager_request_radio from the
-// keyscan/low_power context; pushed here). One-way: there is no power-on — Core 0
-// reboots the chip on the wake keypress, so reconnect runs via the boot path.
-static volatile bool    s_deferred_radio_off     = false;  // send IPC_BLE_POWER_OFF
+// Power requests live in the synchronized IPC slot; wake is a clean reboot.
 
 // DS-priority sequencing — CYW43 cannot do Advertising + Initiating simultaneously.
 // When DS ADV is requested, US reconnect is paused (Core 1 cancels gap_connect).
@@ -138,6 +140,7 @@ static TickType_t s_us_last_connect_tick      = 0;
 // R4: "clear US bond + rescan" two-step — the central teardown was requested
 // (IPC_DISCONNECT_CENTRAL); start the general scan on IPC_CENTRAL_DISCONNECTED.
 static bool s_scan_after_us_disconnect = false;
+static bool s_us_scan_teardown_done = false;
 
 // Distinguish user-initiated slot switch from auto-reconnect.
 // When true, the pending s_deferred_adv_directed is a slot-switch and auto-reconnect
@@ -411,6 +414,7 @@ static void cm_handle_ipc(uint32_t msg) {
         break;
 
     case IPC_CENTRAL_FOUND:
+        s_us_last_connect_tick = xTaskGetTickCount();
         s_upstream = CM_UPSTREAM_CONNECTING;
         DBG_STATUS("[CM] Upstream: device trovato / reconnect in corso\n");
         break;
@@ -439,10 +443,13 @@ static void cm_handle_ipc(uint32_t msg) {
         // The bond was already purged, so the auto-reconnect below cannot fire.
         if (s_scan_after_us_disconnect) {
             s_scan_after_us_disconnect = false;
+            s_us_scan_teardown_done = true;
             s_deferred_scan_general = true;
             DBG_STATUS("[CM] US teardown per rescan completato → scan generale\n");
             break;
         }
+
+        if (s_deferred_scan_general || s_us_scan_teardown_done) break;
 
         // R4: rapid-disconnect backoff (mirror of the DS one). A systematically
         // failing pairing/re-encryption loops connect→fail→disconnect forever,
@@ -620,6 +627,8 @@ static void cm_drain_upstream_hid(void) {
                 action_util_set_usb_upstream_kbd(buf + 1);
             } else if (report_id == HID_REPORT_ID_MOUSE && len >= 1 + 7) {
                 usb_hid_send_mouse_report(buf + 1);
+            } else if (report_id == HID_REPORT_ID_CONSUMER && len >= 1 + 2) {
+                usb_hid_send_consumer_report(buf + 1);   // bug #6: sibling's media keys
             }
         }
 #else
@@ -647,6 +656,10 @@ static void cm_reconcile_with_core1(void) {
     ipc_ble_status_t st;
     ipc_get_ble_status(&st);
     if (!st.valid) return;
+
+    // Bug #3: BLE-side battery view, cached for the config protocol.
+    s_ble_peer_batt  = st.peer_batt;
+    s_ble_mouse_batt = st.mouse_batt;
 
     bool c1_ds_conn = (st.periph == (uint8_t)PERIPH_CONNECTED);
     bool c1_us_conn = (st.central == (uint8_t)CENTRAL_CONNECTED ||
@@ -706,7 +719,12 @@ static void cm_reconcile_with_core1(void) {
             s_mm_us_ghost = 0;
             if (us_ghost) {
                 DBG_STATUS("[CM] RECON: US %d fantasma (Core1 IDLE) → IDLE\n", (int)s_upstream);
-                s_upstream = CM_UPSTREAM_IDLE;
+                if (s_scan_after_us_disconnect) {
+                    // The level confirms teardown even if its FIFO ack was lost.
+                    cm_handle_ipc(IPC_ENCODE(IPC_CENTRAL_DISCONNECTED,0));
+                } else {
+                    s_upstream = CM_UPSTREAM_IDLE;
+                }
             }
             if (ds_ghost) {
                 DBG_STATUS("[CM] RECON: DS ADV fantasma (Core1 IDLE) → IDLE\n");
@@ -738,6 +756,47 @@ static void cm_check_auto(void) {
 // ---------------------------------------------------------------------------
 // Task principale
 // ---------------------------------------------------------------------------
+
+static void cm_process_pair_request(void) {
+        if (s_deferred_scan_general) {
+            // User intent wins over any queued automatic reconnect.
+            s_deferred_reconnect_us = false;
+            s_us_reconnect_pending = false;
+            s_us_rapid_disconnect_count = 0;
+            if (!s_us_scan_teardown_done) {
+                // Even an apparently IDLE Core 0 waits for Core 1 acknowledgement.
+                if (ipc_push_to_core1(IPC_ENCODE(IPC_DISCONNECT_CENTRAL, 0))) {
+                    s_deferred_scan_general=false;
+                    s_scan_after_us_disconnect=true;
+                    s_upstream=CM_UPSTREAM_CONNECTING;
+                    DBG_STATUS("[CM] Pairing: wait for upstream teardown\n");
+                }
+            } else {
+                bool ready=true;
+                if (bonding_store_has_us()) {
+                    uint8_t addr[6],type;
+                    bonding_store_get_us(addr,&type);
+                    ready=ipc_put_delete_bonding_addr(addr,type);
+                    if (ready) {
+                        bonding_store_clear_us();
+                        s_delbond_notify_pending=true;
+                    }
+                }
+                // FIFO ordering guarantees deletion executes before START_SCAN.
+                if (ready && s_delbond_notify_pending) {
+                    if (ipc_push_to_core1(IPC_ENCODE(IPC_DELETE_BONDING,0)))
+                        s_delbond_notify_pending=false;
+                    else ready=false;
+                }
+                if (ready && ipc_push_to_core1(IPC_ENCODE(IPC_START_SCAN,0))) {
+                    s_deferred_scan_general=false;
+                    s_us_scan_teardown_done=false;
+                    s_upstream=CM_UPSTREAM_SCANNING;
+                    DBG_STATUS("[CM] Pairing: teardown complete, deletion queued, scan requested\n");
+                }
+            }
+        }
+}
 
 static void cm_task(void *arg) {
     (void)arg;
@@ -798,13 +857,16 @@ static void cm_task(void *arg) {
         // Executed here (CM task) to keep all IPC pushes to Core 1 within
         // a single owner task, avoiding cross-task FIFO contention.
 
-        // Low-power DEEP-sleep prepare: tell Core 1 to power the radio/CYW43 down.
-        // One-way — the wake path reboots the chip (no power-on IPC).
-        if (s_deferred_radio_off &&
-            ipc_push_to_core1(IPC_ENCODE(IPC_BLE_POWER_OFF, 0))) {
-            s_deferred_radio_off = false;
-            DBG_STATUS("[CM] Deferred: IPC_BLE_POWER_OFF (deep sleep)\n");
+        // Send each power request once; a failed FIFO push is retried. Core 1
+        // checks the token and newest activity before the irreversible commit.
+#ifdef LOW_POWER_ENABLE
+        static uint16_t last_power_sent;
+        power_state_t power; ipc_power_get(&power);
+        if (power.phase==POWER_REQUESTED && power.token!=last_power_sent &&
+            ipc_push_to_core1(IPC_ENCODE(IPC_BLE_POWER_OFF,power.token))) {
+            last_power_sent=power.token;
         }
+#endif
 
         // DS disconnect — must fire first so DS goes IDLE before ADV starts.
         // The actual ADV (directed or general) will execute on a subsequent
@@ -827,7 +889,7 @@ static void cm_task(void *arg) {
             s_delbond_notify_pending = false;
         }
 
-        if (s_deferred_reconnect_us) {
+        if (s_deferred_reconnect_us && !s_deferred_scan_general && !s_scan_after_us_disconnect) {
             // Don't start US reconnect while DS is advertising —
             // CYW43 can't do ADV + Initiating simultaneously.
             // Convert to pending; auto-restart will pick it up when DS finishes.
@@ -881,39 +943,7 @@ static void cm_task(void *arg) {
             }   // push failed → retry next iteration (state NOT advanced)
             }
         }
-        if (s_deferred_scan_general) {
-            // Purge the SM bond too, not just the address. Clearing only the address
-            // leaves the stale LTK in the TLV store → the next connect re-encrypts and
-            // fails ("re-encryption failed 0x13"). Queue the addr for Core 1 to delete.
-            // has_us() guard → idempotent across push retries.
-            if (bonding_store_has_us()) {
-                uint8_t del_addr[6], del_type;
-                bonding_store_get_us(del_addr, &del_type);
-                if (ipc_put_delete_bonding_addr(del_addr, del_type) &&
-                    !ipc_push_to_core1(IPC_ENCODE(IPC_DELETE_BONDING, 0))) {
-                    s_delbond_notify_pending = true;
-                }
-                // bonding_store I2C write runs here (CM task), never from keyscan task
-                bonding_store_clear_us();
-            }
-            // Clear any pending US reconnect — user explicitly wants a new scan
-            s_us_reconnect_pending = false;
-            s_us_rapid_disconnect_count = 0;   // user action resets the backoff
-            if (s_upstream != CM_UPSTREAM_IDLE) {
-                // R4: bond cleared but the link / connect attempt is still up —
-                // tear the central side down first; IPC_CENTRAL_DISCONNECTED
-                // then starts the scan (s_scan_after_us_disconnect).
-                if (ipc_push_to_core1(IPC_ENCODE(IPC_DISCONNECT_CENTRAL, 0))) {
-                    s_deferred_scan_general    = false;
-                    s_scan_after_us_disconnect = true;
-                    DBG_STATUS("[CM] Deferred scan: teardown US prima dello scan\n");
-                }   // push failed → retry next iteration
-            } else if (ipc_push_to_core1(IPC_ENCODE(IPC_START_SCAN, 0))) {
-                s_deferred_scan_general = false;
-                s_upstream = CM_UPSTREAM_SCANNING;
-                DBG_STATUS("[CM] Deferred: clear US + IPC_START_SCAN inviato\n");
-            }   // push failed → retry next iteration
-        }
+        cm_process_pair_request();
         if (s_deferred_clear_all) {
             s_deferred_clear_all = false;
             // Factory reset: clear every bond record AND its SM keys. Runs in the CM
@@ -975,7 +1005,7 @@ static void cm_task(void *arg) {
         // When DS finishes (connected or idle) and US reconnect is pending,
         // re-send IPC_RECONNECT_UPSTREAM. CYW43 can handle established
         // Connection + Initiating; the conflict is only ADV + Initiating.
-        if (s_us_reconnect_pending
+        if (s_us_reconnect_pending && !s_deferred_scan_general && !s_scan_after_us_disconnect
             && s_upstream == CM_UPSTREAM_IDLE
             && s_ds_ble != CM_DS_BLE_ADVERTISING
             && s_ds_ble != CM_DS_BLE_ADV_DIRECTED) {
@@ -1095,7 +1125,9 @@ void connection_manager_ds_adv_general(uint8_t slot) {
 void connection_manager_us_scan_general(void) {
     // Same reasoning: defer bonding_store I2C write to CM task.
     s_us_rapid_disconnect_count = 0;   // user action resets the backoff (R4)
-    s_deferred_scan_general = true;
+    s_deferred_reconnect_us = false;
+    s_us_reconnect_pending = false;
+    if (!s_scan_after_us_disconnect) s_deferred_scan_general = true;
     DBG_STATUS("[CM] Tu long: clear US addr — differito al CM task\n");
 }
 
@@ -1120,18 +1152,6 @@ void connection_manager_us_reconnect(void) {
     } else {
         s_deferred_scan_general = true;    // no bond → plain general scan
         DBG_STATUS("[CM] Tu short: nessun bond US → scan generale — differito\n");
-    }
-}
-
-void connection_manager_request_radio(bool on) {
-    // Low-power DEEP enter. Called from the low_power module (keyscan task): set a
-    // deferred flag only — the CM task owns the FIFO to Core 1 (R3). There is no
-    // power-on (the wake path reboots the chip); on==true just cancels a pending
-    // power-down that has not been sent yet.
-    if (on) {
-        s_deferred_radio_off = false;
-    } else {
-        s_deferred_radio_off = true;
     }
 }
 
@@ -1174,3 +1194,10 @@ cm_ds_slot_state_t connection_manager_ds_slot_state(uint8_t slot) {
 }
 cm_split_role_t     connection_manager_split_role(void)     { return s_split_role;  }
 uint8_t             connection_manager_remote_side(void)    { return s_remote_side; }
+
+// Bug #3: BLE-side battery view (0xFF = unknown). Plain uint8 reads — atomic on
+// ARM, safe from the USB task (config protocol GET_BATTERY).
+void connection_manager_get_ble_batt(uint8_t *peer_out, uint8_t *mouse_out) {
+    if (peer_out)  *peer_out  = s_ble_peer_batt;
+    if (mouse_out) *mouse_out = s_ble_mouse_batt;
+}

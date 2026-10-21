@@ -50,7 +50,14 @@
 // User settings
 // ---------------------------------------------------------------------------
 
-#define DEBUG_STATUS        1   // Connection, ADV/SCAN, pairing, timeout events
+// 1: buffered USB CDC logs; 0: original UART. Requires USB_ENABLE.
+// Does not enable log categories or wait for a serial monitor.
+#ifndef DEBUG_USB_SERIAL
+#define DEBUG_USB_SERIAL    0
+#endif
+
+
+#define DEBUG_STATUS        0   // Connection, ADV/SCAN, pairing, timeout events
 #define DEBUG_UPSTREAM_K    0   // Keyboard reports from upstream BLE device
 #define DEBUG_UPSTREAM_M    0   // Mouse reports from upstream BLE device
 #define DEBUG_DOWNSTREAM_K  0   // Keyboard reports sent to downstream BLE device
@@ -63,6 +70,13 @@
 #define DEBUG_INTER_HALF    0   // Inter-half I2C config transfer: arm/push/apply, frame status (Phase 20)
 #define DEBUG_SPLIT         0   // Split keyboard (Phase 18): slave TX events, master RX + 4x12 resolve
 #define DEBUG_DIAG          0   // [DIAG] drop/error counters dump (10 s cadence, only when non-zero) — counters still readable on-demand via GET_DIAG
+
+// Mouse/link RAM recorder (b009, lag investigation): 4096 × 28 B = 112 KiB of RAM
+// plus a 2 s relay/link sample on Core 1. Read via GET_DIAG 0xFC/0xFD and
+// tools/pythons/cmk_mouse_trace.py. 0 = no buffer, ipc_trace_put() is a no-op.
+#ifndef DEBUG_MOUSE_TRACE
+#define DEBUG_MOUSE_TRACE   0
+#endif
 
 // ---------------------------------------------------------------------------
 // Macros — do not edit below this line

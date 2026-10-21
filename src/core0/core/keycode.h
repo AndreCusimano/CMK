@@ -35,6 +35,8 @@
 //   Mod-Tap      0x2000-0x3FFF   Hold = modifier, Tap = basic keycode
 //   Layer-Tap    0x4000-0x4FFF   Hold = MO(layer), Tap = basic keycode
 //   Layer key    0x5100-0x55FF   MO / TG / TO / DF / OSL
+//   Consumer     0x7100-0x71FF   Media/volume/brightness — Consumer Page report (ID 4)
+//   Macro        0x7700-0x770F   MACRO(n) — EEPROM-stored macros (QMK QK_MACRO base, Phase 15e)
 //   CMK custom   0x7C00-0x7FFF   Firmware-specific (BLE slots, reset, RGB, etc.)
 //
 
@@ -295,9 +297,9 @@ static inline uint8_t mod5_to_hid(uint8_t mod5) {
 #define CMK_TD0      0x7C00   // DS slot 0: short=directed ADV, long=clear+general ADV
 #define CMK_TD1      0x7C01   // DS slot 1
 #define CMK_TD2      0x7C02   // DS slot 2
-#define CMK_TU       0x7C03   // US: short=nothing, long=clear+general scan
+#define CMK_TU       0x7C03   // US: short=reconnect/scan upstream, long=clear+general scan
 
-#define CMK_EE_CLR   0x7C10   // Long press 3s → bonding_store factory reset
+#define CMK_EE_CLR   0x7C10   // Long press 3s → clear all BLE bonds + SM keys
 #define CMK_RESET    0x7C11   // Press → watchdog_reboot()
 
 // HID output destination selector (Phase 14 ext) — see cmk/output_select.h.
@@ -387,7 +389,7 @@ static inline uint8_t mod5_to_hid(uint8_t mod5) {
 // Phase 20 — Inter-half I2C config transfer
 #define CMK_CFG_PUSH         0x7C74   // push this half's config to the peer (become I2C master)
 #define CMK_CFG_RECV         0x7C75   // arm to receive a config push (become I2C slave)
-#define CMK_SPLIT_TOGG       0x7C76   // Phase 20b: toggle split config mode (unified 4×12 view when joined)
+#define CMK_SPLIT_TOGG       0x7C76   // toggle this half's split_mode (same as SET_SETTING 0x05)
 
 // Phase 12 custom keycodes — Unicode mode switching
 #define CMK_UC_WIN           0x7C80   // Unicode mode: Windows (Alt+numpad hex)
@@ -434,6 +436,32 @@ static inline uint8_t mod5_to_hid(uint8_t mod5) {
 #define PB_32   0x701F
 
 // ---------------------------------------------------------------------------
+// Consumer Page keycodes (bug #6) — media/volume/brightness/screen controls.
+// The low byte is an index into consumer_usage_map[] (process_consumer.c),
+// which yields the 16-bit Consumer usage sent in the Report ID 4 field.
+// ---------------------------------------------------------------------------
+
+#define KC_MUTE   0x7100   // Consumer 0x00E2 — Mute
+#define KC_VOLU   0x7101   // Consumer 0x00E9 — Volume Increment
+#define KC_VOLD   0x7102   // Consumer 0x00EA — Volume Decrement
+#define KC_MPLY   0x7103   // Consumer 0x00CD — Play/Pause
+#define KC_MNXT   0x7104   // Consumer 0x00B5 — Scan Next Track
+#define KC_MPRV   0x7105   // Consumer 0x00B6 — Scan Previous Track
+#define KC_MSTP   0x7106   // Consumer 0x00B7 — Stop
+#define KC_BRIU   0x7107   // Consumer 0x006F — Display Brightness Increment
+#define KC_BRID   0x7108   // Consumer 0x0070 — Display Brightness Decrement
+#define KC_MCTL   0x7109   // Consumer 0x029F — AC Desktop Show All Windows (Mission Control)
+#define KC_LPAD   0x710A   // Consumer 0x02A0 — AC Soft Key Left (Launchpad)
+#define CONSUMER_KC_COUNT  11
+
+// ---------------------------------------------------------------------------
+// Macro storage keycodes (Phase 15e) — MACRO(n) plays EEPROM-stored macro n.
+// QMK-compatible base (QK_MACRO = 0x7700), n = 0..MACRO_COUNT-1.
+// ---------------------------------------------------------------------------
+
+#define MACRO(n)   (0x7700 | ((n) & 0x0F))
+
+// ---------------------------------------------------------------------------
 // Unicode codepoint encoding macros
 // ---------------------------------------------------------------------------
 // UC(c):  direct codepoint (BMP 0x0000-0x7FFF) → 0x8000 | c
@@ -469,6 +497,8 @@ static inline uint8_t mod5_to_hid(uint8_t mod5) {
 #define IS_UNICODEMAP_PAIR(kc) ((kc) >= 0x6200 && (kc) <= 0x62FF)
 #define IS_PROG_BUTTON(kc)  ((kc) >= PB_1 && (kc) <= PB_32)
 #define IS_UC_MODE(kc)      ((kc) >= CMK_UC_WIN && (kc) <= CMK_UC_PREV)
+#define IS_MACRO_KC(kc)     (((kc) & 0xFFF0) == 0x7700)
+#define IS_CONSUMER(kc)     (((kc) & 0xFF00) == 0x7100)
 
 // Sub-classification for layer keys
 #define IS_MO(kc)   ((kc) >= 0x5100 && (kc) <= 0x51FF)
@@ -479,6 +509,12 @@ static inline uint8_t mod5_to_hid(uint8_t mod5) {
 
 // Tap Dance extraction
 #define TD_INDEX(kc)  ((kc) & 0x1F)
+
+// Macro extraction (Phase 15e)
+#define MACRO_INDEX(kc)  ((kc) & 0x0F)
+
+// Consumer extraction (bug #6) — index into consumer_usage_map[]
+#define CONSUMER_INDEX(kc)  ((kc) & 0xFF)
 
 // Mouse Keys sub-classification
 #define IS_MOUSEKEY_MOVE(kc)   ((kc) >= 0x6000 && (kc) <= 0x600F)

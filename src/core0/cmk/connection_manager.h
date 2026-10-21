@@ -108,6 +108,11 @@ cm_ds_slot_state_t  connection_manager_ds_slot_state(uint8_t slot);
 cm_split_role_t connection_manager_split_role(void);
 uint8_t         connection_manager_remote_side(void);
 
+// Bug #3: livelli batteria visti via BLE (sibling su CMK-Split, mouse su BAS
+// client), campionati dallo status slot R3. 0xFF = sconosciuto. Letture uint8
+// atomiche — chiamabile dal task USB (config protocol GET_BATTERY).
+void connection_manager_get_ble_batt(uint8_t *peer_out, uint8_t *mouse_out);
+
 // ---------------------------------------------------------------------------
 // Azioni combo — chiamate da cmk_keycodes.c (Core 0 only)
 // ---------------------------------------------------------------------------
@@ -131,10 +136,6 @@ void connection_manager_us_reconnect(void);
 // chiavi SM nel TLV (via IPC_DELETE_BONDING su Core 1). Differito al CM task.
 void connection_manager_clear_all_bonds(void);
 
-// Low-power DEEP sleep radio gating. on=false powers the BLE controller down
-// (IPC_BLE_POWER_OFF — drops all links); on=true re-powers it (the controller
-// re-emits IPC_BLE_WORKING and the CM re-arms ADV/scan). Deferred to the CM task
-// (single FIFO owner, R3); idempotent. Called by the low_power module.
-void connection_manager_request_radio(bool on);
+
 
 #endif // CMK_CONNECTION_MANAGER_H

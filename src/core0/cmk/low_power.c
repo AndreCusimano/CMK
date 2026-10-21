@@ -24,110 +24,125 @@
 //
 
 #include "low_power.h"
-#include "connection_manager.h"   // connection_manager_request_radio (DEEP radio gating)
-#include "usb/usb_hid.h"          // usb_hid_is_active — inhibit DEEP on USB
+#include "eeconfig.h"            // runtime LP timeouts (bug #2)
 #include "config/cmk_config.h"
 #include "config/debug_config.h"
-
+#include "ipc/ipc_core.h"
+#include "pico/time.h"
+#ifdef USB_ENABLE
+#include "usb/usb_hid.h"
+#endif
 #if defined(RGB_MATRIX_ENABLE)
 #include "rgb_matrix.h"
 #endif
 
 #ifdef LOW_POWER_ENABLE
-
-// Idle tracking. s_last_activity is the tick of the most recent key event;
-// s_state is the current tier. Both live on Core 0 only (keyscan task).
-static uint32_t   s_last_activity = 0;
-static lp_state_t s_state         = LP_ACTIVE;
-
-// LED suspend is active in both LIGHT and DEEP; toggle the rgb_matrix flag only
-// on the ACTIVE↔(LIGHT|DEEP) boundary.
-static inline bool suspended_in(lp_state_t s) { return s != LP_ACTIVE; }
-
-// DEEP enter/exit (BLE radio power) — wired in Stage 4 (connection_manager +
-// IPC). Kept as hooks so the state machine and LED/throttle behaviour land
-// independently of the radio path.
-static void enter_deep(void);
-static void exit_deep(void);
-
-static void set_state(lp_state_t s) {
-    if (s == s_state) return;
-    lp_state_t old = s_state;
-    s_state = s;
-
+// Core 0 keyscan owns policy/tier; all shared state crosses the IPC lock.
+static power_local_t s_local;
+static lp_state_t s_state;
+static bool s_reboot;
+static uint64_t s_retry_after;
+// Runtime idle thresholds in ms (bug #2), from eeconfig (seconds x1000) at init
+// and on low_power_refresh_config() — called by the config protocol from the
+// USB/ih_link task: aligned 32-bit stores, benign cross-task race. 0 = tier off.
+static volatile uint32_t s_light_idle_ms = LP_LIGHT_IDLE_MS;
+static volatile uint32_t s_deep_idle_ms  = LP_DEEP_IDLE_MS;
+static void set_state(lp_state_t state) {
+    if (state == s_state) return;
 #if defined(RGB_MATRIX_ENABLE)
-    if (suspended_in(s) != suspended_in(old)) {
-        rgb_matrix_set_suspended(suspended_in(s));
-    }
+    if ((state == LP_ACTIVE) != (s_state == LP_ACTIVE))
+        rgb_matrix_set_suspended(state != LP_ACTIVE);
 #endif
-
-    if (s == LP_DEEP)          enter_deep();
-    else if (old == LP_DEEP)   exit_deep();
-
-    DBG_POWER("[LP] state %d → %d\n", (int)old, (int)s);
+    DBG_STATUS("[LP] tier %u -> %u\n", (unsigned)s_state, (unsigned)state);
+    s_state=state;
 }
-
 void low_power_init(void) {
-    s_last_activity = 0;
-    s_state         = LP_ACTIVE;
+    s_local=(power_local_t){0}; s_state=LP_ACTIVE; s_reboot=false; s_retry_after=0;
+    low_power_refresh_config();   // main.c runs eeconfig_init() before action_init()
 }
-
-void low_power_note_activity(uint32_t now) {
-    s_last_activity = now;
-    if (s_state != LP_ACTIVE) {
-        set_state(LP_ACTIVE);
+void low_power_refresh_config(void) {
+    s_light_idle_ms = (uint32_t)eeconfig_read_lp_light_s() * 1000u;
+    s_deep_idle_ms  = (uint32_t)eeconfig_read_lp_deep_s()  * 1000u;
+    // Core 1 has no EEPROM, so it reads the window from here — but publish it on
+    // the NEXT tick, never from this function: low_power_init() runs inside
+    // action_init(), which main.c executes BEFORE ipc_init(). Calling
+    // ipc_power_local() here takes an uninitialised spinlock and hangs the boot
+    // before the tasks start, before USB and before Core 1 is launched — the
+    // board goes mute on USB *and* on BLE (b025 did exactly this).
+    // low_power_tick() and low_power_note_activity() publish s_local anyway, so
+    // the value reaches Core 1 within one tick: nothing can decide DEEP before.
+    s_local.deep_ms = s_deep_idle_ms;
+    DBG_STATUS("[LP] timeout runtime: light=%lu ms deep=%lu ms (0 = disabilitato)\n",
+               (unsigned long)s_light_idle_ms, (unsigned long)s_deep_idle_ms);
+}
+void low_power_note_activity(uint32_t ticks) {
+    (void)ticks; s_local.key_us=time_us_64();
+    s_local.sample_us=s_local.key_us; s_local.ready=true; ipc_power_local(&s_local);
+}
+void low_power_note_remote_activity(uint32_t ticks) {
+    (void)ticks; s_local.remote_key_us=time_us_64();
+    s_local.sample_us=s_local.remote_key_us; s_local.ready=true; ipc_power_local(&s_local);
+}
+void low_power_update_held(bool held) { s_local.held=held; }
+void low_power_tick(uint32_t ticks) {
+    (void)ticks;
+    uint64_t now=time_us_64();
+    s_local.sample_us=now; s_local.ready=true;
+#ifdef USB_ENABLE
+    s_local.usb=usb_hid_is_active();
+#endif
+    ipc_power_local(&s_local);
+    power_state_t p; ipc_power_get(&p);
+    // There is no radio resume after commit. A new key/USB or stalled teardown
+    // requires the existing clean-reboot path, never a fictitious ACTIVE state.
+    if (p.phase >= POWER_COMMITTED) {
+        s_reboot=s_local.usb || s_local.held || s_local.key_us > p.commit_us ||
+                 s_local.remote_key_us > p.commit_us ||
+                 (p.phase==POWER_COMMITTED && now-p.commit_us >= 3000000);
+        set_state(p.phase==POWER_OFF ? LP_DEEP : LP_LIGHT);
+        return;
     }
+    // Runtime thresholds (bug #2): 0 = tier disabled. A zero DEEP window must
+    // NEVER reach power_veto()/power_request(): with window = 0 every recent()
+    // test is false, so the veto would come back clean and the radio would be
+    // powered off immediately — the exact opposite of "disabled".
+    uint32_t deep_ms  = s_deep_idle_ms;
+    uint32_t light_ms = s_light_idle_ms;
+    if (deep_ms == 0) {
+        if (p.phase==POWER_REQUESTED) {   // disabled mid-window: withdraw
+            ipc_power_cancel();
+            s_retry_after=now+1000000;
+            DBG_STATUS("[LP] DEEP disabilitato: request %u annullata\n",p.token);
+        }
+    } else {
+        uint8_t veto=power_veto(&p,now,deep_ms);
+        if (p.phase==POWER_REQUESTED && (veto || now-p.request_us >= 3000000)) {
+            ipc_power_cancel();
+            s_retry_after=now+1000000;
+            DBG_STATUS("[LP] cancel request %u veto=0x%02x\n",p.token,veto);
+        } else if (p.phase==POWER_RUNNING && !veto && now>=s_retry_after) {
+            uint16_t id=ipc_power_request(now,deep_ms);
+            if (id) DBG_STATUS("[LP] request %u\n",id);
+        }
+    }
+    uint64_t key=power_last_key(&p);
+    bool light=light_ms && !s_local.held && now>=key &&
+               now-key >= (uint64_t)light_ms*1000;
+    set_state(light ? LP_LIGHT : LP_ACTIVE);
 }
-
-void low_power_tick(uint32_t now) {
-    uint32_t idle = now - s_last_activity;   // tick wrap is harmless (both uint32)
-
-    lp_state_t want;
-    if      (idle >= LP_DEEP_IDLE_MS)  want = LP_DEEP;
-    else if (idle >= LP_LIGHT_IDLE_MS) want = LP_LIGHT;
-    else                               want = LP_ACTIVE;
-
-    // Never enter DEEP while USB is connected: we are mains-powered (deep sleep
-    // pointless) and the DEEP wake reboots the chip, which would re-enumerate USB
-    // on every keypress. Cap at LIGHT — LEDs/throttle still save power.
-    if (want == LP_DEEP && usb_hid_is_active()) want = LP_LIGHT;
-
-    if (want != s_state) set_state(want);
-}
-
-lp_state_t low_power_state(void) {
-    return s_state;
-}
-
-uint32_t low_power_scan_interval_ms(void) {
-    return (s_state == LP_ACTIVE) ? KS_SCAN_INTERVAL_MS : LP_LIGHT_SCAN_MS;
-}
-
-bool low_power_deep_requested(void) {
-    return s_state == LP_DEEP;
-}
-
-// --- DEEP radio gating ------------------------------------------------------
-// Power the BLE radio down on DEEP entry and back up on exit. The keyscan stays
-// on the throttled LIGHT cadence (LP_LIGHT_SCAN_MS) in DEEP too, so a keypress
-// is still detected (and snaps back to ACTIVE) within one throttled scan — no
-// GPIO-IRQ keyscan suspend is used, because without tickless idle the 1 kHz
-// SysTick wakes the core every ms regardless, so suspending the scan would save
-// nothing. (GPIO-IRQ wake belongs with the deferred tickless/clock-scaling step.)
-static void enter_deep(void) {
-    connection_manager_request_radio(false);
-}
-static void exit_deep(void) {
-    connection_manager_request_radio(true);
-}
-
-#else  // !LOW_POWER_ENABLE — inert stubs
-
-void       low_power_init(void)                  { }
-void       low_power_note_activity(uint32_t now) { (void)now; }
-void       low_power_tick(uint32_t now)          { (void)now; }
-lp_state_t low_power_state(void)                 { return LP_ACTIVE; }
-uint32_t   low_power_scan_interval_ms(void)      { return KS_SCAN_INTERVAL_MS; }
-bool       low_power_deep_requested(void)        { return false; }
-
-#endif // LOW_POWER_ENABLE
+lp_state_t low_power_state(void) { return s_state; }
+uint32_t low_power_scan_interval_ms(void) { return s_state==LP_ACTIVE ? KS_SCAN_INTERVAL_MS : LP_LIGHT_SCAN_MS; }
+bool low_power_deep_requested(void) { return s_state==LP_DEEP; }
+bool low_power_reboot_needed(void) { return s_reboot; }
+#else
+void low_power_init(void) {}
+void low_power_refresh_config(void) {}
+void low_power_note_activity(uint32_t t) { (void)t; }
+void low_power_note_remote_activity(uint32_t t) { (void)t; }
+void low_power_update_held(bool held) { (void)held; }
+void low_power_tick(uint32_t t) { (void)t; }
+lp_state_t low_power_state(void) { return LP_ACTIVE; }
+uint32_t low_power_scan_interval_ms(void) { return KS_SCAN_INTERVAL_MS; }
+bool low_power_deep_requested(void) { return false; }
+bool low_power_reboot_needed(void) { return false; }
+#endif

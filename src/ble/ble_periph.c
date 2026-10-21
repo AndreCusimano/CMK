@@ -125,6 +125,40 @@ void build_scan_response(void) {
     s_scan_resp_len = (uint16_t)(nlen + 2);
 }
 
+// HCI Advertising_Type (Core spec, LE Set Advertising Parameters):
+//   0x00 ADV_IND
+//   0x01 ADV_DIRECT_IND **high** duty cycle — interval IGNORED, the controller
+//        closes the window after at most 1.28 s and reports LE Connection
+//        Complete with status 0x3C. This is what the code used to send while the
+//        comment claimed "low duty": the real window was 1.28 s, not the 10 s of
+//        the software timer, so two halves powered a couple of seconds apart
+//        never met (bug #4 / #12, see docs/fixes/BLE.md).
+//   0x04 ADV_DIRECT_IND low duty cycle — the interval applies and the window
+//        lasts until WE disable it (ADV_TIMEOUT_MS).
+#define ADV_TYPE_IND              0x00
+#define ADV_TYPE_DIRECT_IND_LOW   0x04
+#define DIRECTED_ADV_INTERVAL     0x00A0   // 160 × 0.625 ms = 100 ms
+
+// Proof-of-behaviour trace (bug #4): the radio's advertising window must match
+// the software timeout. We record when the window opened so EVERY exit path can
+// report how long it really lasted and why it ended — a software timer must never
+// be taken as evidence that the controller is still advertising.
+static uint32_t    s_adv_window_start_ms;
+static const char *s_adv_window_kind = NULL;
+
+static void adv_window_open(const char *kind) {
+    s_adv_window_start_ms = btstack_run_loop_get_time_ms();
+    s_adv_window_kind     = kind;
+}
+
+static void adv_window_close(const char *cause) {
+    if (s_adv_window_kind == NULL) return;          // nothing open: stay quiet
+    uint32_t ms = btstack_run_loop_get_time_ms() - s_adv_window_start_ms;
+    C1_DBG_STATUS("[ADV] finestra %s chiusa dopo %lu ms - causa: %s\n",
+                  s_adv_window_kind, (unsigned long)ms, cause);
+    s_adv_window_kind = NULL;
+}
+
 // Set the random static address for the given DS slot.
 // Must be called before gap_advertisements_set_params / gap_advertisements_enable.
 static void set_slot_address(uint8_t slot) {
@@ -143,6 +177,7 @@ static void adv_timeout_handler(btstack_timer_source_t *ts) {
     UNUSED(ts);
     if (g_ble_periph_state != PERIPH_ADVERTISING &&
         g_ble_periph_state != PERIPH_ADV_DIRECTED) return;  // already connected, ignore
+    adv_window_close("timeout software (ADV_TIMEOUT_MS)");
     C1_DBG_STATUS("[PERIPH] Advertising timeout — stopping\n");
     gap_advertisements_enable(0);
     g_ble_periph_state = PERIPH_IDLE;
@@ -226,7 +261,7 @@ void periph_start_advertising(uint8_t slot) {
     uint16_t adv_int = 0x0030;
     bd_addr_t null_addr;
     memset(null_addr, 0, 6);
-    gap_advertisements_set_params(adv_int, adv_int, 0, 0, null_addr, 0x07, 0x00);
+    gap_advertisements_set_params(adv_int, adv_int, ADV_TYPE_IND, 0, null_addr, 0x07, 0x00);
     gap_advertisements_set_data(sizeof(adv_data), (uint8_t *)adv_data);
     gap_scan_response_set_data(s_scan_resp_len, s_scan_resp);
     gap_advertisements_enable(1);
@@ -237,6 +272,7 @@ void periph_start_advertising(uint8_t slot) {
     btstack_run_loop_set_timer(&s_adv_timeout_timer, ADV_TIMEOUT_MS);
     btstack_run_loop_add_timer(&s_adv_timeout_timer);
 
+    adv_window_open("general");
     g_ble_periph_state  = PERIPH_ADVERTISING;
     s_periph_origin = ORIGIN_GENERAL_ADV;
     s_adv_timeout_end = btstack_run_loop_get_time_ms() + ADV_TIMEOUT_MS;
@@ -276,13 +312,20 @@ void periph_start_advertising_directed(uint8_t slot, const bd_addr_t peer_addr,
     // Set per-slot random static address (no ADV data for directed ADV)
     set_slot_address(slot);
 
-    // ADV_DIRECT_IND low duty cycle: type=1, interval ~100ms (0x00A0).
-    // Low duty gives the peer more time to respond (10s software timeout vs 1.28s hw).
+    // ADV_DIRECT_IND LOW duty cycle (0x04 — see the enum note above; 0x01 would be
+    // high duty: interval ignored and a hard 1.28 s stop in the controller).
     // ADV_DIRECT_IND PDUs carry NO advertising data — do NOT call
     // gap_advertisements_set_data() here (CYW43 may reject/crash).
-    gap_advertisements_set_params(0x00A0, 0x00A0, 0x01,
+    gap_advertisements_set_params(DIRECTED_ADV_INTERVAL, DIRECTED_ADV_INTERVAL,
+                                  ADV_TYPE_DIRECT_IND_LOW,
                                   peer_addr_type, (uint8_t *)peer_addr, 0x07, 0x00);
     gap_advertisements_enable(1);
+    adv_window_open("directed");
+    C1_DBG_STATUS("[ADV] directed slot %u aperta: type=0x%02x (low duty) int=%u u (%u ms) "
+                  "peer=%s type=%u sw_timeout=%d ms\n",
+                  slot, ADV_TYPE_DIRECT_IND_LOW, DIRECTED_ADV_INTERVAL,
+                  (unsigned)(DIRECTED_ADV_INTERVAL * 625u / 1000u),
+                  bd_addr_to_str(peer_addr), peer_addr_type, ADV_TIMEOUT_MS);
 
     // Arm software timeout — same as general ADV
     btstack_run_loop_remove_timer(&s_adv_timeout_timer);
@@ -305,6 +348,7 @@ void periph_start_advertising_directed(uint8_t slot, const bd_addr_t peer_addr,
 // until a new ADV command (IPC_START_ADV / IPC_START_ADV_DIRECTED) arrives.
 void ble_periph_stop_and_reject(void) {
     g_ble_periph_reject = true;
+    adv_window_close("stop richiesto da Core 0 (reject mode)");
     gap_advertisements_enable(0);
     btstack_run_loop_remove_timer(&s_adv_timeout_timer);
     if (g_ble_periph_handle != HCI_CON_HANDLE_INVALID) {
@@ -339,6 +383,7 @@ void ble_periph_on_connected(hci_con_handle_t handle, uint8_t *pkt) {
         C1_DBG_STATUS("[PERIPH] Reject mode — disconnecting peer immediately\n");
         return;
     }
+    adv_window_close("connessione accettata");
     g_ble_periph_handle = handle;
     g_ble_periph_state  = PERIPH_CONNECTED;
     // Cancel general ADV timeout (no-op if not armed)
@@ -361,11 +406,19 @@ void ble_periph_on_connected(hci_con_handle_t handle, uint8_t *pkt) {
 
 // GAP_SUBEVENT_LE_CONNECTION_COMPLETE, role == SLAVE, status != SUCCESS
 void ble_periph_on_conn_failed(uint8_t status) {
-    // Directed ADV timed out (0x3C) or other failure — no connection
+    // Directed ADV timed out (0x3C) or other failure — no connection.
+    // With the low duty type this should NOT happen any more: the controller no
+    // longer closes the window on its own. If it still fires, the log below says so.
     if (g_ble_periph_state == PERIPH_ADV_DIRECTED) {
+        adv_window_close(status == ERROR_CODE_DIRECTED_ADVERTISING_TIMEOUT
+                         ? "chiusa dal CONTROLLER (0x3C) - non dovrebbe accadere in low duty"
+                         : "evento HCI di fallimento");
         g_ble_periph_state = PERIPH_IDLE;
         ipc_push_to_core0(IPC_ENCODE(IPC_PERIPH_ADV_TIMEOUT, 0));
         C1_DBG_STATUS("[PERIPH] Directed ADV timeout (status=0x%02x)\n", status);
+    } else {
+        C1_DBG_STATUS("[PERIPH] conn failed status=0x%02x ignorato (stato=%d, nessuna ADV directed)\n",
+                      status, (int)g_ble_periph_state);
     }
 }
 

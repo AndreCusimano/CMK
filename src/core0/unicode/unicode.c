@@ -189,7 +189,9 @@ void unicode_cycle_mode(bool forward) {
 // ---------------------------------------------------------------------------
 
 void unicode_send_codepoint(uint32_t codepoint) {
-    if (codepoint > 0x7FFF) return;  // BMP only for UC() encoding
+    // BMP only for UC() encoding; 0 = mis-encoded UC key (bare 0x8000 from a
+    // configurator) — typing a hex sequence of zeros helps nobody (bug #5).
+    if (codepoint == 0 || codepoint > 0x7FFF) return;
 
     build_sequence(codepoint);
     s_uc_seq_idx  = 0;

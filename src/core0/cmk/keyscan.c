@@ -124,7 +124,7 @@ static void master_apply_remote(uint8_t r, uint8_t c, bool pressed, uint32_t now
         DBG_SPLIT("[SPLIT-RX] remote r=%u c=%u UP soppresso (SETTINGS per-half)\n", r, c);
         return;
     }
-    low_power_note_activity(now);   // remote (slave) keys keep the MASTER awake
+    low_power_note_remote_activity(now);   // remote (slave) keys keep the MASTER awake
     uint8_t logcol = (uint8_t)(c + remote_col_base());
     DBG_SPLIT("[SPLIT-RX] remote r=%u c=%u -> logcol=%u %s kc=0x%04x\n",
               r, c, logcol, pressed ? "DN" : "UP", layer_lookup(r, logcol));
@@ -167,7 +167,7 @@ static void keyscan_wake_isr(uint gpio, uint32_t events) {
     portYIELD_FROM_ISR(hpw);
 }
 
-static void keyscan_wake_arm(bool enable) {
+static bool keyscan_wake_arm(bool enable) {
     uint8_t        n    = 0;
     const uint8_t *pins = matrix_get_input_pins(&n);
     if (enable) {
@@ -187,6 +187,9 @@ static void keyscan_wake_arm(bool enable) {
 #endif
         matrix_wake_irq_drive(false);         // restore normal scan idle state
     }
+    // An edge before IRQ arming must not be lost: a held key is already LOW.
+    if (enable) for (uint8_t i=0; i<n; ++i) if (!gpio_get(pins[i])) return true;
+    return false;
 }
 #endif // LOW_POWER_ENABLE
 
@@ -368,12 +371,26 @@ static void keyscan_task(void *arg) {
                         }
                     } else {
                         // STANDALONE / MASTER local keys → logical column of this slice.
-                        action_exec(r, (uint8_t)(c + local_base), pressed, (uint32_t)now);
+                        uint8_t lc = (uint8_t)(c + local_base);
+#if defined(RGB_MATRIX_ENABLE)
+                        // Bug #11 — per-half config keys carry NO keypress to the other
+                        // half. Mirror of the two existing gates: the SLAVE keeps FN and
+                        // every key pressed with LAYER_SETTINGS on for itself (see below),
+                        // and master_apply_remote() suppresses remote presses while our
+                        // own SETTINGS layer is held (18n). Without this the MASTER was
+                        // the only half shipping FN across, so FN splashed on the sibling
+                        // in one direction only. Resolved BEFORE action_exec: pressing FN
+                        // turns the layer on, so the post-exec test would be too late
+                        // (key identity decided at press — same philosophy as R2).
+                        bool cfg_key = pressed && (layer_is_on(LAYER_SETTINGS) ||
+                                                   layer_lookup(r, lc) == KC_FN);
+#endif
+                        action_exec(r, lc, pressed, (uint32_t)now);
 #if defined(RGB_MATRIX_ENABLE)
                         // Phase 24b: as MASTER, forward this local hit to the slave
                         // so its reactive effect mirrors our keypress (Core 0 ring →
                         // CM → IPC; never an IPC push straight from the keyscan task).
-                        if (role == CM_SPLIT_MASTER && pressed) {
+                        if (role == CM_SPLIT_MASTER && pressed && !cfg_key) {
                             ipc_rgb_hit_tx_push(CMK_RGB_HIT(board_side_get(), r, c));
                         }
 #endif
@@ -397,6 +414,11 @@ static void keyscan_task(void *arg) {
         }
 #endif
 
+        bool any_held=false;
+        for (uint8_t row=0; row<MATRIX_ROWS; ++row)
+            any_held |= matrix_get_debounced()[row] != 0;
+        low_power_update_held(any_held);
+
         // 4. Tick timers (tapping, RGB, etc.) — runs in every role.
         action_tick((uint32_t)now);
 
@@ -408,11 +430,16 @@ static void keyscan_task(void *arg) {
         DIAG_TASK_ALIVE(DIAG_TASK_KS);
 
 #ifdef LOW_POWER_ENABLE
+        if (low_power_reboot_needed()) {
+            watchdog_reboot(0,0,0);
+            for (;;) { __asm volatile("wfi"); }
+        }
         if (low_power_state() == LP_DEEP) {
             // Suspend the scan and sleep until a key edge. With tickless idle and
             // every other task blocked/throttled, the core stays in WFI here.
-            keyscan_wake_arm(true);
-            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+            s_wake_local=false;
+            if (keyscan_wake_arm(true)) s_wake_local=true;
+            else ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
             keyscan_wake_arm(false);
 #ifdef INTER_HALF_LINK_ENABLE
             // Local key → pulse the sibling so it wakes (reboots) too. A wake from
